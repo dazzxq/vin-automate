@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  vin-automate v2 — Mac launchd job for daily crawl + extract.
+
+  Schedule: every day at 07:00 local time (Asia/Saigon).
+  Working dir: the project folder (replaced by deploy.sh Step 9 if needed).
+  Program:  $REPO/.venv/bin/python $REPO/main.py
+  Output:   $REPO/logs/crawl.out (stdout) + $REPO/logs/crawl.err (stderr)
+
+  deploy.sh Step 9 installs this plist to ~/Library/LaunchAgents/ and runs
+  `launchctl bootstrap` + `launchctl kickstart -k` to register + smoke it.
+  Per PLAN-v2 §10 Step 9, the kickstart writes to crawl.out within 30s so
+  deploy.sh can verify the job actually executed.
+
+  IMPORTANT: the WorkingDirectory + Program* paths below reference the
+  install location at /Users/theduyet/Documents/Code/vin-automate. If the
+  repo lives elsewhere on a given Mac, deploy.sh Step 9 rewrites the path
+  via sed before copying to ~/Library/LaunchAgents/.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tlinh.crawl</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/theduyet/Documents/Code/vin-automate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/theduyet/Documents/Code/vin-automate/.venv/bin/python</string>
+        <string>/Users/theduyet/Documents/Code/vin-automate/main.py</string>
+    </array>
+
+    <!-- Daily at 07:00 local time. launchd uses the user's TZ at trigger
+         time, so this fires at 07:00 Asia/Saigon if that's the Mac's TZ. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- If the Mac was asleep at 07:00, run as soon as it wakes. Avoids
+         silently missing a day. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/theduyet/Documents/Code/vin-automate/logs/crawl.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/theduyet/Documents/Code/vin-automate/logs/crawl.err</string>
+
+    <!-- Inherit a sane PATH so the venv python finds curl, etc. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

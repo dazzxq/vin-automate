@@ -369,7 +369,18 @@ elif [ ! -f "$PLIST_SRC" ]; then
 else
   mkdir -p "$REPO_ROOT/logs"
   : > "$REPO_ROOT/logs/crawl.out"  # truncate so post-kickstart tail is fresh
-  cp "$PLIST_SRC" "$PLIST_DST"
+
+  # The committed plist hardcodes the dev path /Users/theduyet/Documents/Code/vin-automate
+  # for WorkingDirectory, both ProgramArguments entries, and both Standard*Path
+  # entries. Rewrite to the actual $REPO_ROOT before installing.
+  TPL_PATH='/Users/theduyet/Documents/Code/vin-automate'
+  if grep -q "$TPL_PATH" "$PLIST_SRC" && [ "$REPO_ROOT" != "$TPL_PATH" ]; then
+    # Use a sed delimiter that can't appear in either path.
+    sed "s|${TPL_PATH}|${REPO_ROOT}|g" "$PLIST_SRC" > "$PLIST_DST"
+    echo "  [rewrote-paths] template $TPL_PATH -> $REPO_ROOT"
+  else
+    cp "$PLIST_SRC" "$PLIST_DST"
+  fi
   # bootout (idempotent) — safe even if the job isn't currently registered.
   launchctl bootout "gui/$(id -u)/com.tlinh.crawl" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
@@ -389,6 +400,13 @@ else
     fi
     sleep 5
     if [ $i -eq 6 ]; then
+      # Stdout silent — surface stderr (likely an import / venv-resolution
+      # failure) before bailing so the operator sees the actual cause.
+      if [ -s "$REPO_ROOT/logs/crawl.err" ]; then
+        echo "    --- logs/crawl.err (last 10 lines) ---"
+        tail -10 "$REPO_ROOT/logs/crawl.err" | sed 's/^/    | /'
+        echo "    ---------------------------------------"
+      fi
       err "launchd kickstart produced no output in logs/crawl.out within 30s — check plist StandardOutPath / job exit code via 'launchctl print gui/\$(id -u)/com.tlinh.crawl'"
     fi
   done
