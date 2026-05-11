@@ -101,7 +101,7 @@ Ask user to:
 
 1. Open Cowork sidebar → Scheduled.
 2. Check: is there a task named `vinfast-pipeline`? [y/N]
-   - If **N** → "Click '+' New Task → Name: vinfast-pipeline; Frequency: Hourly; paste cowork-task-prompt.md content into prompt; Save."
+   - If **N** → "Click '+' New Task → Name: vinfast-pipeline; Frequency: Daily; paste cowork-task-prompt.md content into prompt; Save."
    - If **y** → "Click vào task `vinfast-pipeline` → Edit. Verify the prompt matches cowork-task-prompt.md exactly. If different, REPLACE the entire prompt body. Save. DO NOT create a duplicate task."
    - If user reports MULTIPLE `vinfast-pipeline` tasks → "Xóa các duplicate, chỉ giữ 1."
 3. After save, click "Run now" on the task.
@@ -167,7 +167,7 @@ If 600s timeout → tell user "Saved task didn't notify our test row. Verify the
 
 Ask: "Bạn nhận được tin nhắn Telegram chứa chuỗi `<TOKEN>` không? [y/N]"
 
-- On **y** AND notified_at set within Phase B window → SUCCESS. Print: "Setup verified end-to-end. Pipeline sẽ chạy mỗi giờ."
+- On **y** AND notified_at set within Phase B window → SUCCESS. Print: "Setup verified end-to-end. Pipeline sẽ chạy mỗi ngày."
 - On **N** → diagnose chat_id, network, bot blocked.
 
 ## Step 6 — Completion summary
@@ -175,7 +175,7 @@ Ask: "Bạn nhận được tin nhắn Telegram chứa chuỗi `<TOKEN>` không?
 ```
 ✅ Setup hoàn tất + verified end-to-end.
 
-Pipeline sẽ tự chạy mỗi giờ khi Claude Desktop còn mở.
+Pipeline sẽ tự chạy mỗi ngày khi Claude Desktop còn mở.
 Mac sleep → miss runs (Cowork catch-up 1 lần khi mở lại app).
 
 Brainstorm: /idea-brainstormer <id>

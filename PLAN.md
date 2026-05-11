@@ -8,7 +8,7 @@ Build a local-first news aggregation pipeline that:
 - **Claude in Cowork** scores each article 1–5 against a tunable rubric (no API, no subprocess — Cowork IS the runtime).
 - Pushes high-score articles to Telegram for human review.
 - On-demand inside Cowork via slash skill `/idea-brainstormer <id>`, Claude brainstorms 5 story ideas per article.
-- Persists all state in SQLite. Runs hourly via **Claude Cowork scheduled tasks** on macOS.
+- Persists all state in SQLite. Runs daily via **Claude Cowork scheduled tasks** on macOS.
 
 **Out of scope:** Social platforms (FB, TikTok), multi-user, cloud deployment, real-time push, automated publishing.
 
@@ -23,7 +23,7 @@ Build a local-first news aggregation pipeline that:
 The runtime is **Claude in Cowork**, not a Python orchestrator. Python provides deterministic tool helpers (crawl, extract, DB writes, Telegram). Claude does the AI reasoning (scoring, brainstorming) inside its agentic session. Cowork's `/schedule` is the scheduler — there is no `launchd`, no `claude -p` subprocess, no Anthropic SDK.
 
 ```
-Claude Cowork scheduled task (hourly)
+Claude Cowork scheduled task (daily, 24h)
   │ (Claude opens the project folder, fresh session)
   ├─ Read cowork-task-prompt.md          ── orchestration brief (uses <OWNER_ID> placeholder)
   ├─ Read scoring-rubric.md              ── 1–5 thang điểm
@@ -96,7 +96,7 @@ Permissions required:
 - Network: all domains (Homebrew CDN, PyPI, Google News, Telegram, Jina).
 - No MCP servers required for v1.
 
-Schedule (created at the end of the BOOTSTRAP.md flow — §2.1.1 Step 5): `/schedule` → "hourly" → paste `cowork-task-prompt.md` content as the task prompt. BOOTSTRAP.md shows the content inline and instructs the user to copy-paste, since Cowork's scheduled-task UI is not bash-controllable. Verification is mandatory via "Run now" on the saved task (see §2.1.1 Step 5 + ISSUE-6 fix).
+Schedule (created at the end of the BOOTSTRAP.md flow — §2.1.1 Step 5): `/schedule` → **"daily"** → paste `cowork-task-prompt.md` content as the task prompt. BOOTSTRAP.md shows the content inline and instructs the user to copy-paste, since Cowork's scheduled-task UI is not bash-controllable. Verification is mandatory via "Run now" on the saved task (see §2.1.1 Step 5 + ISSUE-6 fix).
 
 ### 2.1.1 One-time onboarding flow (paste `BOOTSTRAP.md` into Cowork chat)
 
@@ -179,14 +179,14 @@ The bootstrap flow is **a single pasted prompt**, not a slash skill (slash skill
   │     ├─ Bash: cat cowork-task-prompt.md → output displayed inline
   │     ├─ **Idempotency check (ISSUE-17)**: Claude asks user: 
   │     │   "Mở sidebar Cowork → Scheduled. Bạn có thấy task tên `vinfast-pipeline` nào đã tồn tại không? [y/N]"
-  │     │   - On **N** (first-run): "Click '+' New Task → Name: vinfast-pipeline; Frequency: Hourly; 
+  │     │   - On **N** (first-run): "Click '+' New Task → Name: vinfast-pipeline; Frequency: Daily; 
   │     │     Paste nội dung ở trên vào prompt; Save."
   │     │   - On **y** (reconfiguration): "Click vào task `vinfast-pipeline` hiện có → Edit → 
   │     │     **Verify the prompt body matches the content above; if it differs, REPLACE the prompt body 
   │     │     entirely** (do NOT create a duplicate task); Save."
   │     │   - **If user reports MULTIPLE tasks named `vinfast-pipeline`**: ask user to delete the older 
   │     │     duplicates from sidebar before continuing (only one task should remain). Claude reminds: 
-  │     │     "Cowork không tự dedup; xóa duplicate để tránh chạy 2 lần mỗi giờ."
+  │     │     "Cowork không tự dedup; xóa duplicate để tránh chạy 2 lần mỗi ngày."
   │     │
   │     ├─ STEP 5.1 — Pre-arm with a uniquely-tokenized test row (ISSUE-10 priority + ISSUE-11 attribution):
   │     │   - Bash: TOKEN=$(python -c 'import secrets; print(secrets.token_hex(6))')  # e.g. "a7f3e1b2c4d5"
@@ -222,7 +222,7 @@ The bootstrap flow is **a single pasted prompt**, not a slash skill (slash skill
   │     │     pre-scored + priority-sorted FIRST in the notify pass, normal completion is <30s.
   │     │
   │     │   Note on attribution: signal is uniquely attributable because the row has a unique TOKEN that
-  │     │   no concurrent pipeline run can produce. Even if the hourly schedule fires DURING the wait,
+  │     │   no concurrent pipeline run can produce. Even if the scheduled run fires DURING the wait,
   │     │   only a run that processes our specific tokenized row can flip its notified_at — and any such
   │     │   run must be using a prompt body that orchestrates the pipeline correctly.
   │     │
@@ -240,7 +240,7 @@ The bootstrap flow is **a single pasted prompt**, not a slash skill (slash skill
   │
   ├─ Step 6: Completion
   │     ├─ "Setup done + verified end-to-end."
-  │     ├─ "Cowork sẽ tự chạy mỗi giờ khi Claude Desktop còn mở."
+  │     ├─ "Cowork sẽ tự chạy mỗi ngày khi Claude Desktop còn mở."
   │     ├─ "Brainstorm: /idea-brainstormer <id> (slash skill installed at Step 4)"
   │     └─ "Để re-config sau: /setup hoặc paste BOOTSTRAP.md lại."
 ```
@@ -293,7 +293,7 @@ Schema init is a **setup-time** action (Task 3 / `install.sh`), never a runtime 
 - `install.sh` — venv, deps, schema init, sanity checks
 
 **AI orchestration (Claude reads these at runtime):**
-- `cowork-task-prompt.md` — paste this into Cowork's `/schedule` UI (the scheduled hourly run)
+- `cowork-task-prompt.md` — paste this into Cowork's `/schedule` UI (the scheduled daily run)
 - `SKILLS/setup.skill` — **post-bootstrap reconfiguration skill** at `/Users/theduyet/Documents/Code/vin-automate/SKILLS/setup.skill`. Invoked via `/setup` AFTER BOOTSTRAP.md has installed it. Re-runs the §2.1.1 flow idempotently for reconfiguration (new Telegram bot, new chat, refresh skill symlinks, re-verify scheduler). NOT the primary onboarding path — BOOTSTRAP.md is.
 - `SKILLS/idea-brainstormer.skill` — Cowork **slash-command skill** at `/Users/theduyet/Documents/Code/vin-automate/SKILLS/idea-brainstormer.skill`. Invoked from any Cowork chat via `/idea-brainstormer [ID|filter]`. Loads `brainstorm-guidelines.md`, calls `list.py` to get article(s) from DB (NOT from a snapshot file — DB is source of truth), generates 5-idea JSON, writes via `mark.py brainstorm`.
 - `scoring-rubric.md` — 1–5 thang điểm with examples
@@ -528,7 +528,7 @@ UPDATE locks
 - On `rowcount == 0` → exit 75 with `[lock] lost ownership (likely TTL-reclaimed by another session)`. **The caller (Cowork) MUST abort the run immediately on heartbeat failure** to avoid racing the new owner.
 
 **TTL sizing strategy:**
-- `LOCK_TTL_SECONDS` default = **1800 (30 min)** — generous for a healthy run (typical: <5 min), tight enough that a crashed Cowork session releases the lock well before the next hourly schedule.
+- `LOCK_TTL_SECONDS` default = **1800 (30 min)** — generous for a healthy run (typical: <5 min), tight enough that a crashed Cowork session releases the lock well before the next daily schedule.
 - The Cowork task prompt MUST call `heartbeat` between major stages: after crawl, after extract, before the scoring loop, after every N scored rows (config `HEARTBEAT_EVERY_N_ROWS`, default 10), and before the notify pass. The notify pass is followed directly by `release`, so a post-notify heartbeat is unnecessary (release operates on `name` + `owner_id` regardless of TTL). Each heartbeat resets `expires_at` to `now + LOCK_TTL_SECONDS`.
 - If Cowork crashes between heartbeats, `LOCK_TTL_SECONDS` upper-bounds the recovery delay. Worst case: 30 min until next scheduled run can reclaim.
 
@@ -685,7 +685,7 @@ Each row is one scenario in `E2E-VALIDATION.md`.
 | 2e | Telegram HTML safety | Inject test article with title `Test <b>&*_[](.).</b>` | message arrives in chat; bot does NOT return 400 |
 | 3 | Brainstorm preserves notified state via `/idea-brainstormer` skill | Run scheduled task to get a notified article (say id=42). In a fresh Cowork chat: type `/idea-brainstormer 42` | Row 42 has BOTH `notified_at` AND `brainstormed_at` non-null; `ideas` is valid JSON of length 5. Free-form trigger (typing only "brainstorm article 42" without the slash command) is NOT the canonical path and not part of acceptance. |
 | 4 | `list.py --json` | `python list.py --stage notified --json \| jq` | exits 0; valid JSON array |
-| 5 | Cowork scheduled task exists & runs | In Cowork sidebar, scheduled task "vinfast-pipeline" visible with hourly cadence; trigger manually; verify `logs/pipeline.log` has entry timestamped within last 60s | screenshot + log line |
+| 5 | Cowork scheduled task exists & runs | In Cowork sidebar, scheduled task "vinfast-pipeline" visible with daily cadence; trigger manually; verify `logs/pipeline.log` has entry timestamped within last 60s | screenshot + log line |
 | 6 | No secrets in tree | `grep -rIE '[0-9]{9,}:AAE[a-zA-Z0-9_-]{30,}\|sk-(ant-)?[a-zA-Z0-9_-]{20,}' . --exclude-dir=.venv --exclude='.env' --exclude='news.db'` | zero matches |
 | 7a | Run-level SQLite mutex blocks overlapping runs (owner_id propagated via captured UUID) | Shell A: `OWNER_A=$(python lock.py acquire pipeline-run --ttl 600)`. Shell B (fresh): `python lock.py acquire pipeline-run` → exits 75. Shell C (fresh): `python lock.py release pipeline-run "$OWNER_A"` → exits 0, rowcount log shows 1. Shell D: `python lock.py acquire pipeline-run` → exits 0 (returns NEW UUID) | DB is the only shared state; owner_id is passed as a CLI arg, not read from any file. `sqlite3 news.db "SELECT count(*) FROM locks"` returns 0 after Shell C, then 1 after Shell D. |
 | 7b | mark.py score CAS no-op | `python mark.py score 1 4 "first"` then `python mark.py score 1 5 "second"` | 1st updates row with score=4; 2nd exits 0 with `[mark.py] row 1 already scored; no-op`; DB still shows score=4 |

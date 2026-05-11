@@ -68,7 +68,7 @@ command to run, the expected evidence, and the **current verification status**.
 **Deployment go/no-go criteria:**
 - All ✅ rows must remain green at HEAD.
 - 🟡 rows graduate to ✅ on first successful BOOTSTRAP.md run with real Telegram credentials.
-- ⏳ rows graduate to ✅ on first hourly scheduled run.
+- ⏳ rows graduate to ✅ on first daily scheduled run.
 
 ---
 

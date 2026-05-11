@@ -1,8 +1,8 @@
 # Cowork Scheduled Task — VinFast News Pipeline
 
-**Paste the ENTIRE content of this file** (from the first `## SETUP` heading below to the bottom) into Cowork's `/schedule` "New Task" prompt field. Set frequency to **Hourly**. Save as task name **`vinfast-pipeline`**.
+**Paste the ENTIRE content of this file** (from the first `## SETUP` heading below to the bottom) into Cowork's `/schedule` "New Task" prompt field. Set frequency to **Daily**. Save as task name **`vinfast-pipeline`**.
 
-The scheduled task runs once per hour while Mac is awake and Claude Desktop is open. Each run is a fresh Cowork session: no memory of previous runs.
+The scheduled task runs once per day while Mac is awake and Claude Desktop is open. Each run is a fresh Cowork session: no memory of previous runs.
 
 ---
 

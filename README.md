@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](#license)
 [![Codex-reviewed](https://img.shields.io/badge/codex--reviewed-30%20rounds%2C%2063%20issues-brightgreen)](#code-review-trail)
 
-> Pipeline tự động crawl tin VinFast theo chủ đề, **để Claude trong Cowork chấm điểm 1–5 và brainstorm 5 ideas**, push high-score lên Telegram, lưu SQLite. Chạy mỗi giờ qua Cowork's `/schedule`. Non-tech onboarding: paste `BOOTSTRAP.md` vào Cowork chat — không cần CLI knowledge.
+> Pipeline tự động crawl tin VinFast theo chủ đề, **để Claude trong Cowork chấm điểm 1–5 và brainstorm 5 ideas**, push high-score lên Telegram, lưu SQLite. Chạy mỗi ngày qua Cowork's `/schedule`. Non-tech onboarding: paste `BOOTSTRAP.md` vào Cowork chat — không cần CLI knowledge.
 
 ---
 
@@ -35,7 +35,7 @@
 # 2. Mở Cowork chat mới, paste TOÀN BỘ nội dung BOOTSTRAP.md.
 # 3. Claude tự cài Homebrew + Python + venv + schema, hỏi token Telegram qua
 #    deterministic nonce flow, install slash skills, verify scheduler end-to-end.
-# Done. Pipeline chạy mỗi giờ.
+# Done. Pipeline chạy mỗi ngày (Cowork Daily).
 ```
 
 Sau đó:
@@ -70,7 +70,7 @@ Pipeline này tự động hóa **bước 1 và 2**, và làm **bước 3 on-dem
                   │  Claude Desktop (Pro/Max)                       │
                   │                                                 │
                   │   ┌─────────────────────────────────────────┐   │
-                  │   │ Cowork Scheduled Task (hourly)          │   │
+                  │   │ Cowork Scheduled Task (daily)           │   │
                   │   │  ├─ Read scoring-rubric.md              │   │
                   │   │  ├─ lock.py acquire pipeline-run        │   │
                   │   │  ├─ Bash: python crawl.py               │───┼─▶ Google News RSS
@@ -169,7 +169,7 @@ Pipeline này tự động hóa **bước 1 và 2**, và làm **bước 3 on-dem
    - **MANDATORY scheduler verification**: pre-arm tokenized test row → user click "Run now" trên saved task → poll Phase A (60s startup) + Phase B (10min completion) → user confirm Telegram message chứa TOKEN
    - Completion summary
 
-Done. Pipeline tự chạy mỗi giờ.
+Done. Pipeline tự chạy mỗi ngày.
 
 ### Path B — Terminal fallback
 
@@ -322,7 +322,7 @@ Google News URLs trả về Google's bridge page thay vì source. `crawl.py` res
 
 ### Mac sleep / Claude Desktop closed
 
-Cowork scheduled task **chỉ chạy** khi Mac thức + Claude Desktop mở. Sleep qua đêm → miss runs. Khi mở lại app, Cowork catch-up **1 lần** (không backfill từng giờ).
+Cowork scheduled task **chỉ chạy** khi Mac thức + Claude Desktop mở. Sleep qua đêm → miss run. Khi mở lại app, Cowork catch-up **1 lần** (không backfill từng ngày trước đó).
 
 Mitigation:
 - System Settings → Battery → "Prevent automatic sleeping when display is off"

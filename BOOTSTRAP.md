@@ -221,7 +221,7 @@ Hướng dẫn user:
 ```
 1. Mở sidebar Cowork → Scheduled.
 2. Có task tên 'vinfast-pipeline' nào đã tồn tại không? [y/N]
-   - Nếu N → Click '+' New Task → Name: vinfast-pipeline; Frequency: Hourly; 
+   - Nếu N → Click '+' New Task → Name: vinfast-pipeline; Frequency: Daily; 
              Paste nội dung cowork-task-prompt.md vào prompt; Save.
    - Nếu y → Click vào task đó → Edit. REPLACE prompt body với nội dung 
              cowork-task-prompt.md. Save. KHÔNG TẠO DUPLICATE.
@@ -319,11 +319,11 @@ Hỏi: "Bạn vừa nhận tin nhắn Telegram có chứa chuỗi `${TEST_TOKEN}
 
 - Telegram credentials: ✅
 - Slash skills installed: /idea-brainstormer, /setup
-- Scheduled task 'vinfast-pipeline': ✅ runs hourly
+- Scheduled task 'vinfast-pipeline': ✅ runs daily
 - Verification: Telegram message received with token ${TEST_TOKEN}
 
 Tiếp theo:
-- Bot sẽ tự crawl + score + push Telegram mỗi giờ (khi Mac thức + Claude Desktop mở).
+- Bot sẽ tự crawl + score + push Telegram mỗi ngày (khi Mac thức + Claude Desktop mở).
 - Khi thấy tin hay trong Telegram, copy [#<id>] → mở Cowork chat → gõ /idea-brainstormer <id>
 - Cấu hình lại sau: type /setup trong Cowork chat
 ```
