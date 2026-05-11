@@ -1,64 +1,132 @@
-# Resume notes — for next session
+# Status when you wake up (2026-05-12)
 
-## Current state (2026-05-12, after Codex APPROVE)
+## TL;DR
 
-**PLAN-v2.md: APPROVED** by Codex plan-review session
-`codex-plan-review-20260511-004` after 9 review rounds (22 issues
-ISSUE-8..29 resolved). Plan covers v2 3-tier architecture (Mac crawl +
-VPS PHP/MariaDB backend + Cowork AI scoring + Telegram).
+**Backend is fully deployed and live at https://tlinh.duyet.vn.**
+All 18 implementation tasks committed + pushed to GitHub. Phase A
+infrastructure deploy succeeded. Bootstrap test row already seeded.
 
-### Critical infrastructure context (from user 2026-05-12)
-- Wildcard `*.duyet.vn` cert pre-installed at
-  `/etc/letsencrypt/live/duyet.vn/` (SAN includes `*.duyet.vn` and apex,
-  valid until 2026-06-21). **Step 6 does NOT run certbot** — only verifies.
-- VPS SSH alias `vps-root` working (Ubuntu 24.04, nginx, PHP 8.5, MariaDB 10.11).
-- CF Global API key in keychain (`security find-generic-password -s cloudflare-global-api-key -a the@duyet.dev -w`).
-- User granted bypass_permissions for autonomous run; no need to ask before
-  destructive ops within v2 implementation scope.
+Two things waiting on you:
+1. **Phase B Cowork setup** (manual UI clicks in Claude Desktop — I can't do this).
+2. **macOS TCC grant** (optional — for daily auto-crawl via launchd).
 
-### Implementation order (per §11 task breakdown)
-1. `vps/schema.sql` — DB tables with notify_claimed_at/notify_claim_owner
-2-7. PHP backend (bootstrap, Db, Auth, Router, hashing, all routes)
-8. `scripts/deploy.sh` + `vps/nginx-tlinh.conf.tpl` (Phase A)
-8a. `scripts/telegram-nonce-helper.sh`
-9. `scripts/dns_setup.sh`
-10. `api_client.py`
-11. `crawl.py` rewrite (HTTP-based)
-12. `extract.py` rewrite (HTTP-based)
-13. `cowork-task-prompt.md` (rewritten HTTP-based)
-14. `SKILLS/idea-brainstormer.skill` (rewritten HTTP-based)
-15. `com.tlinh.crawl.plist` + `main.py`
-16. `install.sh` (slim — venv + deps only)
-17. `README.md` v2
-18. `E2E-VALIDATION-v2.md`
+Everything else is done. The pipeline is ready to test end-to-end.
 
-### Codex impl-review protocol (per CLAUDE.md)
-- Each task: implement → `/codex-impl-review` → fix → commit
-- Issues from Codex impl-review must be fixed and re-reviewed until APPROVE
-  before commit.
+---
 
-### Files state
+## What's live
 
-| File | State |
-|---|---|
-| `PLAN.md` | v1 plan (architecturally obsolete) |
-| `PLAN-v2.md` | **APPROVED** — implementation spec |
-| `RESUME-NEXT-SESSION.md` | this file |
-| `.codex-round*-pending.json` | Codex review snapshots (gitignored) |
-| `crawl.py`, `extract.py`, ... | v1 Python — to be REWRITTEN per Tasks 11-12 |
-| `backend/` | NOT yet created — Tasks 1-7 |
-| `scripts/` | NOT yet created — Tasks 8, 8a, 9 |
-
-### Active GitHub repo
-https://github.com/dazzxq/vin-automate (public)
-
-### Codex sessions (history)
-
-| Session | Topic | Status |
+| Component | State | Verification |
 |---|---|---|
-| codex-plan-review-20260511-001 | v1 plan original | APPROVE (16 rounds, 30 issues) |
-| codex-plan-review-20260511-002 | v1 onboarding delta | APPROVE (7 rounds, 17 issues) |
-| codex-impl-review-20260511-001 | v1 Task 1 impl | APPROVE (2 rounds, 3 issues) |
-| codex-impl-review-20260511-002 | v1 Tasks 2-18 impl | APPROVE (7 rounds, 16 issues) |
-| codex-plan-review-20260511-003 | v2 plan — session 1 | finalized partway, replaced by -004 |
-| codex-plan-review-20260511-004 | **v2 plan — APPROVED** | APPROVE (9 rounds, 22 issues) |
+| DNS `tlinh.duyet.vn → 14.225.29.159` | ✅ | `dig +short @1.1.1.1 tlinh.duyet.vn` |
+| nginx vhost + wildcard cert | ✅ | `curl -i https://tlinh.duyet.vn/api/health` returns 200 |
+| MariaDB `tlinh_news` + 2 tables | ✅ | `articles` + `locks`, with notify_claimed_at columns |
+| PHP backend (10 routes) | ✅ | `/api/health` returns `{"status":"ok","db":"connected","version":"v2"}` |
+| `tlinh` DB user (DML-only grants) | ✅ | `SELECT, INSERT, UPDATE, DELETE` on `tlinh_news.*` |
+| Mac venv + httpx + trafilatura + feedparser | ✅ | `install.sh` ran cleanly |
+| Mac `.env` + `SKILLS/.env` (mode 600) | ✅ | Both gitignored |
+| Bootstrap test row | ✅ | id=207, token `e3429f9e30474866`, score=5, notified_at=NULL |
+
+---
+
+## What needs your action (when convenient)
+
+### 1. Phase B Cowork setup (required for daily auto-pipeline)
+
+In Claude Desktop:
+
+1. **Create a Cowork project** pointing at `/Users/theduyet/Documents/Code/vin-automate/`.
+2. **Grant bash + network "Allow all"**.
+3. **Open Cowork chat → `/schedule`** → paste the entire contents of
+   `cowork-task-prompt.md`. Set:
+   - Frequency: **Daily**
+   - Name: **vinfast-pipeline**
+   - Save.
+4. **Click "Run now"** on `vinfast-pipeline`.
+5. **Within 10 minutes**, your Telegram should receive a message containing
+   the token `e3429f9e30474866` — that's the bootstrap verification.
+6. Once verified, the pipeline runs daily without further action.
+
+### 2. macOS TCC grant (optional — for daily Mac-side auto-crawl)
+
+The launchd job that auto-runs `main.py` daily at 07:00 is currently
+**blocked by macOS TCC** because the repo lives in `~/Documents`.
+
+Two options:
+
+**Option A — Grant /bin/bash Full Disk Access:**
+- System Settings → Privacy & Security → Full Disk Access → `+` → add `/bin/bash`.
+- Then re-run `bash scripts/deploy.sh` — Step 9 will succeed and the launchd job
+  will tick at 07:00 every day.
+
+**Option B — Run main.py manually whenever you want:**
+```bash
+cd /Users/theduyet/Documents/Code/vin-automate
+.venv/bin/python main.py
+```
+The Cowork-side scheduled task already runs daily independent of this, so
+you only need to do Option A or B if you want fresh crawled articles each
+day (vs. only what the bootstrap row provides).
+
+### 3. Clean up
+
+After Phase B is verified:
+```bash
+cd /Users/theduyet/Documents/Code/vin-automate
+rm -fP deploy.env   # macOS BSD overwrite-before-unlink
+```
+
+---
+
+## Codebase summary
+
+22 commits over this session. 7 implementation commits + 1 deploy fix +
+~10 plan/setup commits.
+
+```
+8564095 Deploy-time hardening fixes (Codex APPROVE, 4 rounds)
+3be5853 Tasks 17-18: README v2 + E2E-VALIDATION-v2 (Codex APPROVE, 5 rounds)
+2a77787 Tasks 15-16: launchd plist + main.py + install.sh slim (Codex APPROVE, 3 rounds)
+de5f292 Tasks 13-14: Cowork prompt + idea-brainstormer skill v2 (Codex APPROVE, 6 rounds)
+f70aeb3 Tasks 10-12: Mac client v2 + v1 cleanup (Codex APPROVE, 3 rounds)
+87d8e5a Tasks 8+8a+9: deploy / DNS / telegram scripts (Codex APPROVE, 5 rounds)
+daf5274 Tasks 3-6: PHP route handlers + Telegram client (Codex APPROVE, 4 rounds)
+1685f29 Tasks 2+7: PHP backend skeleton + Hashing (Codex APPROVE, 2 rounds)
+ee8708b Task 1: vps/schema.sql (Codex impl-review APPROVE, 2 rounds)
+3dad8ae PLAN-v2 approved by Codex (9 rounds, 22 issues resolved)
+```
+
+**Codex review trail:**
+- Plan review: 9 rounds, 22 issues
+- Impl reviews: 8 sessions, ~38 rounds, ~50 issues
+
+Total **~47 review rounds, ~72 issues resolved** before anything merged.
+
+---
+
+## GitHub
+
+https://github.com/dazzxq/vin-automate (commit `8564095`)
+
+---
+
+## If something breaks
+
+| Symptom | Action |
+|---|---|
+| Telegram never arrives after Run now | Check VPS PHP error log: `ssh vps-root 'journalctl -u php8.5-fpm --since "10 minutes ago"' \| grep notify.` |
+| `/api/health` 503 | `ssh vps-root 'mariadb -u tlinh -p\$DB_PASS -e "SELECT 1"'` (using ROOT_DB_PASS from deploy.env if needed) |
+| Cowork bash hard-exits | `ls -la SKILLS/.env` — must exist + be mode 600 |
+| Need to re-run deploy | `bash scripts/deploy.sh` — idempotent, all steps short-circuit on re-run |
+
+All commands in `E2E-VALIDATION-v2.md` for the §13 acceptance matrix.
+
+---
+
+## Codex sessions (history)
+
+| Session | Rounds | Verdict |
+|---|---|---|
+| codex-plan-review-20260511-004 | 9 | APPROVE |
+| codex-impl-review-20260511-003..010 | 2/2/4/5/3/6/3/5 | All APPROVE |
+| codex-impl-review-20260511-011 (deploy-fixes) | 4 | APPROVE |
