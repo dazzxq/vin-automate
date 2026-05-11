@@ -34,3 +34,16 @@ __pycache__/
 
 # Codex review artifacts (sessions, render outputs, telemetry) — entire tree
 .codex-review/
+
+# v2 architecture (PLAN-v2)
+deploy.env
+backend/.env
+backend/.env.local
+backend/.env.production
+backend/logs/
+backend/vendor/
+SKILLS/.env
+.codex-round2-pending.json
+*.pem
+*.key
+secrets/
