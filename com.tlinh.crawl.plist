@@ -26,10 +26,15 @@
     <key>WorkingDirectory</key>
     <string>/Users/theduyet/Documents/Code/vin-automate</string>
 
+    <!-- launchd resolves symlinks when exec'ing the Program, which would
+         dereference .venv/bin/python to the homebrew binary and lose the
+         venv's site-packages. Delegating to scripts/run-launchd.sh keeps
+         the activate-then-exec sequence in a real shell script (one path
+         in argv, no inline `bash -c` quoting hazards if the repo lives in
+         a path with spaces / shell-special chars). -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/theduyet/Documents/Code/vin-automate/.venv/bin/python</string>
-        <string>/Users/theduyet/Documents/Code/vin-automate/main.py</string>
+        <string>/Users/theduyet/Documents/Code/vin-automate/scripts/run-launchd.sh</string>
     </array>
 
     <!-- Daily at 07:00 local time. launchd uses the user's TZ at trigger

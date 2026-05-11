@@ -100,13 +100,36 @@ ok "code synced (sha=${GIT_SHA}), schema uploaded to /tmp/schema.sql"
 # Secrets travel via ssh STDIN as prefixed `KEY=<quoted value>` assignments
 # (per Codex impl-review): the ssh argv only contains `bash -s`, so the
 # secret never appears in /proc/$pid/cmdline or in journald audit logs.
+#
+# Root grants: if deploy.env defines ROOT_DB_PASS the script authenticates
+# with it via a temp --defaults-extra-file (so the password stays out of
+# argv on the VPS as well). Otherwise it falls back to socket auth, which
+# works on a stock Ubuntu MariaDB install. The fall-through is the path
+# PLAN-v2 §10 Step 4 documented; the explicit-password path is new.
 step "Step 4 — DB user + schema"
 {
-  printf 'DB_PASS=%q\n' "$DB_PASS"
+  printf 'DB_PASS=%q\n'      "$DB_PASS"
+  printf 'ROOT_DB_PASS=%q\n' "${ROOT_DB_PASS:-}"
   cat <<'REMOTE'
 set -euo pipefail
-# Root grants — uses socket auth, no password in argv.
-mariadb -u root <<SQL
+
+# Build a per-process credentials file ONLY when ROOT_DB_PASS is set;
+# otherwise leave the variable empty so mariadb falls back to socket auth.
+ROOT_CRED_ARG=""
+ROOT_CRED_FILE=""
+if [ -n "${ROOT_DB_PASS:-}" ]; then
+  ROOT_CRED_FILE=$(mktemp /tmp/.tlinh-root.XXXXXX)
+  chmod 600 "$ROOT_CRED_FILE"
+  cat > "$ROOT_CRED_FILE" <<CRED
+[client]
+user=root
+password=$ROOT_DB_PASS
+CRED
+  ROOT_CRED_ARG="--defaults-extra-file=$ROOT_CRED_FILE"
+fi
+trap '[ -n "${ROOT_CRED_FILE:-}" ] && (shred -u "$ROOT_CRED_FILE" 2>/dev/null || rm -f "$ROOT_CRED_FILE")' EXIT
+
+mariadb $ROOT_CRED_ARG -u root <<SQL
 CREATE DATABASE IF NOT EXISTS tlinh_news CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS 'tlinh'@'localhost' IDENTIFIED BY '$DB_PASS';
 ALTER USER 'tlinh'@'localhost' IDENTIFIED BY '$DB_PASS';
@@ -114,18 +137,11 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON tlinh_news.* TO 'tlinh'@'localhost';
 FLUSH PRIVILEGES;
 SQL
 
-# Schema import — keep DB_PASS out of mariadb argv by routing it through
-# a 600-mode option file. Trap on EXIT so the file is shredded even if the
-# import fails part-way.
-CRED_FILE="$(mktemp /tmp/.tlinh-mariadb.XXXXXX)"
-chmod 600 "$CRED_FILE"
-trap 'shred -u "$CRED_FILE" 2>/dev/null || rm -f "$CRED_FILE"' EXIT
-cat > "$CRED_FILE" <<CRED
-[client]
-user=tlinh
-password=$DB_PASS
-CRED
-mariadb --defaults-extra-file="$CRED_FILE" tlinh_news < /tmp/schema.sql
+# Schema import — apply as ROOT because the tlinh user is granted only
+# DML privileges (SELECT/INSERT/UPDATE/DELETE) and cannot CREATE TABLE.
+# Schema management is intentionally a root operation; the runtime user
+# stays minimal-priv.
+mariadb $ROOT_CRED_ARG -u root tlinh_news < /tmp/schema.sql
 rm -f /tmp/schema.sql
 REMOTE
 } | ssh "$VPS_SSH_ALIAS" 'bash -s'
@@ -158,7 +174,7 @@ TELEGRAM_CHAT_ID=$TG_CHAT_ID
 TITLE_DEDUP_WINDOW_HOURS=48
 MAX_RETRIES=3
 LOCK_TTL_SECONDS=1800
-NOTIFY_CLAIM_TTL_SECONDS=300
+NOTIFY_CLAIM_TTL_SECONDS=320
 NOTIFY_CLAIM_HEARTBEAT_SECONDS=20
 NOTIFY_TELEGRAM_RETRY_AFTER_CAP_SECONDS=60
 NOTIFY_TELEGRAM_REQUEST_TIMEOUT_SECONDS=30
@@ -186,7 +202,7 @@ cat > "${TMPF}" <<NGINX
 # Rate-limit zones (per Codex ISSUE-10)
 limit_req_zone \$http_authorization zone=tlinh_main:10m   rate=100r/m;
 limit_req_zone \$http_authorization zone=tlinh_lock:10m   rate=600r/m;
-limit_req_zone \$http_authorization zone=tlinh_hourly:10m rate=1000r/h;
+limit_req_zone \$http_authorization zone=tlinh_hourly:10m rate=17r/m;
 limit_req_status 429;
 map \$status \$retry_after_header { 429 "60"; default ""; }
 
@@ -368,15 +384,24 @@ elif [ ! -f "$PLIST_SRC" ]; then
   STEP9_DEFER_REASON="plist_missing"
 else
   mkdir -p "$REPO_ROOT/logs"
-  : > "$REPO_ROOT/logs/crawl.out"  # truncate so post-kickstart tail is fresh
+  # Truncate BOTH stdout + stderr logs so stale content from a previous run
+  # can't false-positive the TCC detection below (which greps crawl.err).
+  : > "$REPO_ROOT/logs/crawl.out"
+  : > "$REPO_ROOT/logs/crawl.err"
 
   # The committed plist hardcodes the dev path /Users/theduyet/Documents/Code/vin-automate
-  # for WorkingDirectory, both ProgramArguments entries, and both Standard*Path
-  # entries. Rewrite to the actual $REPO_ROOT before installing.
+  # for WorkingDirectory, the wrapper script in ProgramArguments, and both
+  # Standard*Path entries. Rewrite to the actual $REPO_ROOT before
+  # installing. Use python3 .replace() (literal substitution) instead of
+  # sed s|...|...| — sed's replacement string interprets `&`, `\`, and the
+  # delimiter `|`, which corrupts repos whose path contains any of them.
   TPL_PATH='/Users/theduyet/Documents/Code/vin-automate'
   if grep -q "$TPL_PATH" "$PLIST_SRC" && [ "$REPO_ROOT" != "$TPL_PATH" ]; then
-    # Use a sed delimiter that can't appear in either path.
-    sed "s|${TPL_PATH}|${REPO_ROOT}|g" "$PLIST_SRC" > "$PLIST_DST"
+    TPL_PATH="$TPL_PATH" REPO_ROOT="$REPO_ROOT" \
+      python3 -c 'import os, sys
+tpl = os.environ["TPL_PATH"]; root = os.environ["REPO_ROOT"]
+src = open(sys.argv[1]).read()
+open(sys.argv[2], "w").write(src.replace(tpl, root))' "$PLIST_SRC" "$PLIST_DST"
     echo "  [rewrote-paths] template $TPL_PATH -> $REPO_ROOT"
   else
     cp "$PLIST_SRC" "$PLIST_DST"
@@ -400,8 +425,41 @@ else
     fi
     sleep 5
     if [ $i -eq 6 ]; then
-      # Stdout silent — surface stderr (likely an import / venv-resolution
-      # failure) before bailing so the operator sees the actual cause.
+      # Surface stderr first — if it shows "Operation not permitted" that's
+      # the macOS TCC restriction blocking launchd from ~/Documents. Most
+      # users hit this; it isn't a deploy bug. Emit a clear runbook instead
+      # of bailing. TCC manifests two ways:
+      #   (a) crawl.err contains "Operation not permitted" (rare — only
+      #       when launchd CAN write the err file but the bash command
+      #       inside hits TCC reading from ~/Documents);
+      #   (b) crawl.err is never created AND launchctl print shows
+      #       "last exit code = 78: EX_CONFIG" — this is the common case
+      #       where TCC blocks BEFORE bash even runs.
+      # launchctl print "last exit code = N: NAME" — capture the integer.
+      LAST_RC=$(launchctl print "gui/$(id -u)/com.tlinh.crawl" 2>/dev/null \
+        | awk -F'= ' '/last exit code/{split($2, a, ":"); print a[1]; exit}')
+      TCC_HIT=0
+      if [ -s "$REPO_ROOT/logs/crawl.err" ] \
+         && grep -q "Operation not permitted" "$REPO_ROOT/logs/crawl.err"; then
+        TCC_HIT=1
+      elif [ ! -s "$REPO_ROOT/logs/crawl.err" ] && [ "$LAST_RC" = "78" ]; then
+        # crawl.err empty/missing + EX_CONFIG (78) = TCC blocked at the
+        # launchd boundary before bash could write anything. (We truncate
+        # crawl.err at the start of Step 9, so its emptiness is meaningful.)
+        TCC_HIT=1
+      fi
+      if [ "$TCC_HIT" = "1" ]; then
+        warn "launchd is blocked by macOS TCC from accessing ~/Documents."
+        warn "To enable the daily auto-run, do ONE of:"
+        warn "  a) System Settings → Privacy & Security → Full Disk Access →"
+        warn "     add /bin/bash (or move the project out of ~/Documents)."
+        warn "  b) Trigger main.py manually from Terminal whenever you want:"
+        warn "       cd $REPO_ROOT && .venv/bin/python main.py"
+        warn "Backend deploy succeeded — Cowork side is unaffected by this."
+        STEP9_DEFERRED=1
+        STEP9_DEFER_REASON="macos_tcc"
+        break
+      fi
       if [ -s "$REPO_ROOT/logs/crawl.err" ]; then
         echo "    --- logs/crawl.err (last 10 lines) ---"
         tail -10 "$REPO_ROOT/logs/crawl.err" | sed 's/^/    | /'
@@ -419,11 +477,13 @@ if [ "${STEP8_DEFERRED:-0}" = "1" ] || [ "${STEP9_DEFERRED:-0}" = "1" ]; then
   Infra portion succeeded, but Mac-side wiring is DEFERRED:
 NOTE
   [ "${STEP8_DEFERRED:-0}" = "1" ] && echo "    - Step 8 (install + smoke): waiting on Tasks 10 + 16."
-  # Step 9's reason depends on WHY it deferred — Step-8 dependency vs plist missing.
+  # Step 9's reason depends on WHY it deferred.
   if [ "${STEP9_DEFERRED:-0}" = "1" ]; then
     case "${STEP9_DEFER_REASON:-plist_missing}" in
       step8_dependency)
         echo "    - Step 9 (launchd plist):    waiting on Tasks 10 + 16 (transitively via Step 8)." ;;
+      macos_tcc)
+        echo "    - Step 9 (launchd plist):    blocked by macOS TCC on ~/Documents." ;;
       plist_missing|*)
         echo "    - Step 9 (launchd plist):    waiting on Task 15." ;;
     esac
@@ -441,8 +501,11 @@ cat <<NOTE
     3. Seed bootstrap test row via SSH-tunneled curl (Step 12 in plan).
     4. Click "Run now" in the Cowork UI; verify Telegram receives the test message
        containing your bootstrap token within 10 min.
-    5. Shred deploy.env: shred -u deploy.env
+    5. Remove deploy.env after Phase B. macOS doesn't ship 'shred'; use the
+       BSD equivalent: 'rm -fP deploy.env' (overwrite-before-unlink). If you
+       installed GNU coreutils via Homebrew you can also run
+       'gshred -u deploy.env'.
 
-  Phase A does NOT shred deploy.env (per Codex ISSUE-18) — it must survive
+  Phase A does NOT delete deploy.env (per Codex ISSUE-18) — it must survive
   into Phase B so manual commands can re-source it with 'set -a; . deploy.env; set +a'.
 NOTE

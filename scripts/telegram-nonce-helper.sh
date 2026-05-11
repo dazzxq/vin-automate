@@ -175,6 +175,10 @@ CF_ZONE_ID=d738588b6a6169bdd8ccde1921f3a62a
 CF_EMAIL=the@duyet.dev
 TG_TOKEN=
 TG_CHAT_ID=
+# ROOT_DB_PASS is OPTIONAL. Leave empty when MariaDB root uses Unix-socket
+# auth (Ubuntu default with debian-sys-maint). Set it when root requires
+# a password (e.g. shared-hosting VPS with explicit root password).
+ROOT_DB_PASS=
 EOF
   chmod 600 "$DEPLOY_ENV"
 fi

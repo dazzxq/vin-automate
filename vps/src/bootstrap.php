@@ -6,8 +6,25 @@ declare(strict_types=1);
 
 namespace { // global namespace for the autoloader closure
 
-    // Resolve env path relative to the release directory (release/v1 -> shared/.env).
-    $envPath = dirname(__DIR__, 2) . '/shared/.env';
+    // Resolve env path relative to the release directory. The deploy layout is:
+    //   /var/www/tlinh/tlinh.duyet.vn/
+    //     ├── releases/v1/src/bootstrap.php  ← this file
+    //     ├── current  → releases/v1         (symlink)
+    //     └── shared/.env                     ← what we want
+    //
+    // PHP canonicalizes symlinks in __DIR__, so __DIR__ resolves to the
+    // releases/v1/src path even when reached via /current/src/. We must
+    // therefore walk 3 levels up (src → v1 → releases → tlinh.duyet.vn)
+    // not 2. Fall back to the 2-level path so any future layout that
+    // skips the release-versioning layer still works.
+    $candidates = [dirname(__DIR__, 3) . '/shared/.env', dirname(__DIR__, 2) . '/shared/.env'];
+    $envPath = null;
+    foreach ($candidates as $c) {
+        if (is_readable($c)) { $envPath = $c; break; }
+    }
+    if ($envPath === null) {
+        $envPath = $candidates[0]; // for the error message below
+    }
     if (!is_readable($envPath)) {
         // shared/.env is created by deploy.sh Step 5. If we got here without
         // it, the deploy is broken — fail fast instead of leaking PHP errors.
