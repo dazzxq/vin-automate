@@ -38,7 +38,7 @@ Build a 3-tier news aggregation pipeline:
 **Runtime targets:**
 
 - Mac client: macOS 13+, Python 3.11+ in `.venv`. Optional — only needed for crawl scheduling.
-- VPS: Ubuntu 24.04 (existing 14.225.29.159), nginx, PHP 8.5+, MariaDB 10.11+, certbot.
+- VPS: Ubuntu 24.04 (existing 14.225.29.159), nginx, PHP 8.5+, MariaDB 10.11+, certbot timer (only for cert RENEWAL — issuance is NOT performed during deploy because the wildcard `*.duyet.vn` cert is pre-installed at `/etc/letsencrypt/live/duyet.vn/`).
 - Cowork: Claude Desktop Pro/Max plan, Linux sandbox bash tool (just curl required).
 
 ---
@@ -255,11 +255,30 @@ Query params:
 - `stage`: `new` | `extracted` | `scored` | `notified` | `brainstormed` | `failed`
 - `min_score`, `max_score`, `score`: int
 - `not_scored`, `not_notified`, `not_brainstormed`: bool (`1`/`0`)
-- `final_state`: `discarded` | `archived` | `active`
+- `final_state`: `discarded` | `archived` | `active` (per Codex ISSUE-21: `active` is a server-side alias for `final_state IS NULL` — i.e. the row is still in the pipeline, not yet terminal. The DB column itself only stores `'discarded'`, `'archived'`, or `NULL`.)
 - `since`: ISO date (default: 7 days ago)
 - `last_hours`: int
 - `search`: keyword (LIKE on title + content)
 - `limit`: int (default 50, max 200)
+
+**`stage` predicate definitions (per Codex ISSUE-13) — server-enforced, single source of truth:**
+
+| stage | category | SQL predicate |
+|---|---|---|
+| `new` | queue | `extracted_at IS NULL AND final_state IS NULL AND retry_count < MAX_RETRIES` |
+| `extracted` | queue | `extracted_at IS NOT NULL AND scored_at IS NULL AND final_state IS NULL AND retry_count < MAX_RETRIES` |
+| `scored` | queue | `scored_at IS NOT NULL AND notified_at IS NULL AND final_state IS NULL AND retry_count < MAX_RETRIES` |
+| `failed` | queue | `failed_at IS NOT NULL AND final_state IS NULL` (transient failures; discarded rows are NOT in this stage) |
+| `notified` | terminal | `notified_at IS NOT NULL` |
+| `brainstormed` | terminal | `brainstormed_at IS NOT NULL` |
+
+`MAX_RETRIES` is read from `.env` server-side.
+
+**Discard exclusion semantics (per Codex ISSUE-19):**
+- **Queue stages** (`new`, `extracted`, `scored`, `failed`) explicitly exclude discarded rows via `final_state IS NULL`. Once a row is discarded, it is removed from every queue stage and cannot be picked up by extract/score/notify clients.
+- **Terminal stages** (`notified`, `brainstormed`) intentionally do NOT filter by `final_state`. These stages report observed completed actions: a row that reached `notified_at NOT NULL` succeeded the notify side effect — that historical fact does not get unset if the row is later marked discarded (which would only happen via a separate manual path, since Phase 2 only discards on transient failure before notify succeeds). In practice the union `notified ∩ discarded` is empty by the pipeline's monotonic state progression.
+
+To inspect discarded rows, callers explicitly pass `final_state=discarded`; this filter is orthogonal to the stage filter.
 
 Response 200:
 ```json
@@ -327,7 +346,11 @@ Response 200:
 
 **Race-safety design (per Codex ISSUE-1):** Telegram send is a side effect that must run AT MOST ONCE per article. Pure CAS on `notified_at` cannot guarantee this if two callers POST concurrently — both pass the `notified_at IS NULL` check, both send, only one wins the UPDATE. **Fix: 2-phase atomic claim before external call:**
 
-**Phase 1 — Claim (transactional UPDATE, no external I/O):**
+**Phase 1 — Claim (transactional UPDATE, no external I/O, with TTL-based reclaim retry — per Codex ISSUE-14):**
+
+The flow has TWO sub-steps. Stale-claim reclaim is integrated, not a side note.
+
+*Phase 1a — Fresh claim attempt:*
 ```sql
 UPDATE articles
    SET notify_claimed_at = NOW(),
@@ -339,32 +362,108 @@ UPDATE articles
    AND final_state IS NULL
 ```
 - `rowcount == 1` → exclusive owner of the send. Continue to Phase 2.
-- `rowcount == 0` → another caller already claimed (or threshold/score/state fails). Return 200 no-op.
+- `rowcount == 0` → either another caller already claimed, or the row is ineligible (threshold/score/state). Proceed to Phase 1b to disambiguate.
+
+*Phase 1b — Disambiguate (single SELECT, no race needed because Phase 2 is the only writer to these fields):*
+```sql
+SELECT notified_at, notify_claimed_at, score, final_state
+  FROM articles
+ WHERE id = ?
+```
+Branch on the result (per Codex ISSUE-24 — `final_state` values are distinguished):
+- `notified_at IS NOT NULL` → return 200 `{"sent": false, "reason": "already_notified"}`. Done.
+- `final_state = 'discarded'` → return 200 `{"sent": false, "reason": "discarded"}`. Done.
+- `final_state = 'archived'` → return 200 `{"sent": false, "reason": "archived"}`. Done.
+- `score IS NULL` → return 200 `{"sent": false, "reason": "no_score"}`. Done.
+- `score < MIN_SCORE_TO_NOTIFY` → return 200 `{"sent": false, "reason": "below_threshold"}`. Done.
+- `notify_claimed_at IS NOT NULL AND notify_claimed_at >= NOW() - INTERVAL NOTIFY_CLAIM_TTL_SECONDS SECOND` → live owner is heartbeating. Return 200 `{"sent": false, "reason": "already_claimed"}`. Done.
+- `notify_claimed_at IS NOT NULL AND notify_claimed_at < NOW() - INTERVAL NOTIFY_CLAIM_TTL_SECONDS SECOND` → **stale claim**. Proceed to Phase 1c (one reclaim attempt).
+
+*Phase 1c — Stale-claim reclaim (atomic, CAS on claim age):*
+```sql
+UPDATE articles
+   SET notify_claimed_at = NOW(),
+       notify_claim_owner = ?  -- NEW owner UUID
+ WHERE id = ?
+   AND notified_at IS NULL
+   AND notify_claimed_at < NOW() - INTERVAL ? SECOND  -- NOTIFY_CLAIM_TTL_SECONDS
+   AND score >= ?
+   AND final_state IS NULL
+```
+- `rowcount == 1` → reclaim succeeded; we now own the claim. Continue to Phase 2.
+- `rowcount == 0` → another caller raced us through reclaim. Return 200 `{"sent": false, "reason": "already_claimed", "stale_lost_race": true}`. Done.
+
+**Reclaim is attempted AT MOST ONCE per request.** We do not loop Phase 1a→1b→1c repeatedly — that would risk a livelock if two dead owners race two fresh callers. AC `#5b-dead` verifies the single-attempt path.
 
 **Phase 2 — Send + finalize (after Phase 1 returns rowcount=1):**
 1. Build HTML-escaped message from article fields.
-2. POST `api.telegram.org/bot<TOKEN>/sendMessage` (with 429 Retry-After + 5xx backoff per §9).
-3. On Telegram 200 OK:
+2. **Start claim-heartbeat task** (background thread / async loop): every
+   `NOTIFY_CLAIM_HEARTBEAT_SECONDS` (default 20s) issue:
    ```sql
    UPDATE articles
-      SET notified_at = NOW(), telegram_msg_id = ?
+      SET notify_claimed_at = NOW()
+    WHERE id = ?
+      AND notify_claim_owner = ?
+      AND notified_at IS NULL
+   ```
+   If `rowcount == 0` (someone else stole the claim, or `notified_at` got
+   set), the heartbeat task signals the main thread to ABORT the send
+   immediately. (See §9 for Telegram retry interplay.)
+3. POST `api.telegram.org/bot<TOKEN>/sendMessage` (with 429 Retry-After + 5xx backoff per §9). Each retry attempt MUST first check that the claim is still held; if the heartbeat task signaled abort, do NOT continue retrying.
+4. On Telegram 200 OK (finalize CAS-bound to our claim — per Codex ISSUE-23, this UPDATE also clears any prior transient-failure markers):
+   ```sql
+   UPDATE articles
+      SET notified_at = NOW(),
+          telegram_msg_id = ?,
+          notify_claimed_at = NULL,
+          notify_claim_owner = NULL,
+          failed_at = NULL,
+          last_error = NULL
     WHERE id = ?
       AND notify_claim_owner = ?  -- our claim
+      AND notified_at IS NULL
    ```
-4. On Telegram permanent failure (4xx other than 429): release the claim so retry can succeed:
+   Note: `retry_count` is intentionally NOT reset — it stays for observability.
+   If `rowcount == 0` (claim was stolen mid-send), log
+   `notify.claim_stolen_post_send` with `telegram_msg_id` so user can manually
+   reconcile, and return 200 `{"sent": true, "warning": "claim_stolen_after_send"}`.
+   (See "Claim TTL sizing" below for why this is bounded to be extremely rare.)
+5. On Telegram permanent failure (4xx other than 429): release the claim so retry can succeed:
    ```sql
    UPDATE articles SET notify_claimed_at = NULL, notify_claim_owner = NULL
     WHERE id = ? AND notify_claim_owner = ?
    ```
    Then call `/api/articles/{id}/fail` with `stage='notify'` to bump retry_count.
+6. Stop heartbeat task (in `finally`).
 
-**Stale claim recovery:** if a claim is older than `NOTIFY_CLAIM_TTL_SECONDS` (default 60s) AND `notified_at IS NULL`, the server can opportunistically clear it on the next claim attempt:
-```sql
-UPDATE articles SET notify_claimed_at = NULL, notify_claim_owner = NULL
- WHERE id = ? AND notify_claimed_at < NOW() - INTERVAL ? SECOND
-   AND notified_at IS NULL
-```
-This handles the case where the server crashed between Phase 1 and Phase 2.
+**Claim TTL sizing (per Codex ISSUE-8):** the TTL must bound the worst-case
+Phase-2 send window, NOT just be a magic 60s constant. We compute:
+
+- `NOTIFY_TELEGRAM_MAX_BACKOFF_SECONDS` = 1+2+4+8+16 = 31s (per §9 5xx schedule).
+- `NOTIFY_TELEGRAM_RETRY_AFTER_CAP_SECONDS` = 60s (server-side cap on honoring
+  Telegram's `Retry-After`; if Telegram asks for more we ABORT and return 502).
+- `NOTIFY_TELEGRAM_REQUEST_TIMEOUT_SECONDS` = 30s (per request).
+- `NOTIFY_PHASE2_BUDGET_SECONDS` = backoff + retry-after cap + 5 × request
+  timeout = 31 + 60 + 150 = **241s** worst case.
+- `NOTIFY_CLAIM_HEARTBEAT_SECONDS` = 20s (≤ 1/3 of TTL).
+- `NOTIFY_CLAIM_TTL_SECONDS` = max(`NOTIFY_PHASE2_BUDGET_SECONDS` + 60s safety,
+  `3 × NOTIFY_CLAIM_HEARTBEAT_SECONDS`) = **300s** (5 minutes).
+
+These are configurable via `.env` but their relative ordering MUST hold:
+`heartbeat × 3 ≤ TTL` AND `phase2_budget + 60 ≤ TTL`. The server validates
+this on boot and refuses to start if violated.
+
+**Stale-claim recovery semantics (per Codex ISSUE-8 + ISSUE-14):** the
+reclaim happens in Phase 1c (above). Because the live owner heartbeats every
+20s, a claim older than `NOTIFY_CLAIM_TTL_SECONDS` (300s default) implies ≥
+280s of heartbeat silence — which can only happen if the owning process died.
+The Phase 1c UPDATE atomically transfers ownership and proceeds to Phase 2;
+no separate "release then re-claim" path is needed.
+
+If Telegram's `Retry-After` exceeds `NOTIFY_TELEGRAM_RETRY_AFTER_CAP_SECONDS`,
+the server logs `notify.retry_after_exceeded_cap` and returns 502 (release
+claim via Phase 2 step 5, call /fail). This prevents an attacker / Telegram
+outage from holding a claim indefinitely.
 
 Request body: (none required)
 
@@ -373,9 +472,30 @@ Response 200 (sent):
 {"id": 42, "sent": true, "telegram_msg_id": 123, "notified_at": "2026-05-12T08:20:00"}
 ```
 
-Response 200 (no-op — already notified or claim lost to concurrent caller):
+Response 200 (no-op — already notified, claim lost, or ineligible). The `reason` enum (per Codex ISSUE-22) is:
+
+| `reason` | When |
+|---|---|
+| `already_notified` | `notified_at IS NOT NULL` at Phase 1b SELECT. |
+| `discarded` | `final_state = 'discarded'` at Phase 1b SELECT (per Codex ISSUE-24 — retry-exhaustion terminal state). |
+| `archived` | `final_state = 'archived'` at Phase 1b SELECT (per Codex ISSUE-24 — operator-driven terminal state, distinct from `discarded`). |
+| `no_score` | `score IS NULL` at Phase 1b SELECT. |
+| `below_threshold` | `score < MIN_SCORE_TO_NOTIFY` at Phase 1b SELECT. |
+| `already_claimed` | Phase 1b SELECT found a live (non-stale) claim held by another owner. |
+| `already_claimed` + `stale_lost_race: true` | Phase 1c reclaim raced and lost to a concurrent caller. Same `reason` string but with the extra boolean for observability. |
+
 ```json
-{"id": 42, "sent": false, "reason": "already_notified|already_claimed|below_threshold|no_score|discarded"}
+{"id": 42, "sent": false, "reason": "already_claimed", "stale_lost_race": true}
+```
+
+Other no-op cases omit `stale_lost_race`:
+```json
+{"id": 42, "sent": false, "reason": "already_notified"}
+```
+
+Response 200 (sent, but claim was stolen mid-finalize — rare, see Phase 2 step 4):
+```json
+{"id": 42, "sent": true, "telegram_msg_id": 123, "warning": "claim_stolen_after_send"}
 ```
 
 Response 502 (Telegram permanent error, claim released, retry_count bumped):
@@ -440,9 +560,20 @@ UPDATE articles
 Idempotent: calling `/fail` on a row that has already reached `final_state='discarded'`
 returns 200 with `discarded: true` and does NOT increment further.
 
-Success-path clearing (Codex ISSUE-2): when a stage succeeds (PATCH /extract,
-PATCH /score, POST /notify-finalize), the server clears `failed_at` and
-`last_error` for that row (but keeps `retry_count` for observability).
+Success-path clearing (Codex ISSUE-2 + ISSUE-22 + ISSUE-23): every successful
+stage transition clears `failed_at = NULL` and `last_error = NULL` in the same
+SQL UPDATE that records the success. This is implemented at:
+
+- `PATCH /api/articles/{id}/extract`: the UPDATE that sets `extracted_at` and
+  `content` MUST also set `failed_at = NULL, last_error = NULL`.
+- `PATCH /api/articles/{id}/score`: the UPDATE that sets `scored_at`,
+  `score`, and `score_reason` MUST also set `failed_at = NULL, last_error = NULL`.
+- `POST /api/notify/{id}` Phase 2 step 4 finalize UPDATE: explicitly includes
+  `failed_at = NULL, last_error = NULL` (see SQL block above).
+
+There is no separate `POST /notify-finalize` endpoint; the finalize happens
+internally inside `POST /api/notify/{id}` Phase 2. `retry_count` is kept for
+observability across all three paths.
 
 
 #### POST /api/admin/inject-test (per Codex ISSUE-3)
@@ -650,9 +781,10 @@ vin-automate-main/
 - No local state. No locks needed Mac-side (Mac is single writer for crawl; VPS endpoint is idempotent via `url_hash` UNIQUE).
 
 **`extract.py` behavior:**
-- GET `/api/articles?stage=new` (rows where `extracted_at IS NULL`).
+- GET `/api/articles?stage=new` (server-defined predicate: `extracted_at IS NULL AND final_state IS NULL AND retry_count < MAX_RETRIES` — see §4 GET /api/articles).
 - For each row: fetch content via trafilatura/Jina.
 - PATCH `/api/articles/{id}/extract` with content.
+- On exhausted retries (transient failures): POST `/api/articles/{id}/fail` with `stage=extract`. Server increments `retry_count` and sets `final_state='discarded'` once `retry_count >= MAX_RETRIES`. Discarded rows never re-appear in `stage=new`.
 
 **`api_client.py` behavior:**
 - `post_article(payload) -> dict`
@@ -730,11 +862,11 @@ Single mechanism only. **No hardcoded tokens in skill files or task prompts.**
 
 Hardcoded tokens, environment frontmatter, or interactive prompts are FORBIDDEN — they reintroduce v1-class secret leakage risk.
 
-### 5.4 DNS + HTTPS deployment (Cloudflare + certbot)
+### 5.4 DNS + HTTPS deployment (Cloudflare + existing wildcard cert — per user 2026-05-12)
 
 **DNS setup (automated via CF API):**
-1. Create A record `tlinh.duyet.vn → 14.225.29.159`, `proxied=false` (gray cloud) for cert issuance.
-2. After certbot succeeds and renewal works for 1 cycle, optionally set `proxied=true`.
+1. Create A record `tlinh.duyet.vn → 14.225.29.159`, `proxied=false` initially.
+2. Cloudflare proxy can be enabled later (independently of cert state).
 3. CF API endpoints:
    - `POST /zones/{zone_id}/dns_records` to create
    - `PATCH /zones/{zone_id}/dns_records/{id}` to toggle proxied
@@ -747,9 +879,16 @@ Hardcoded tokens, environment frontmatter, or interactive prompts are FORBIDDEN 
 - Security headers: `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`.
 - `client_max_body_size 5M` (enough for article content).
 
-**certbot:**
-- `certbot --nginx -d tlinh.duyet.vn` (after DNS propagates with proxy off).
-- Auto-renew via `systemd-timer` (already configured on this VPS for other certs).
+**HTTPS (NO certbot run — wildcard cert already issued):**
+- VPS already has wildcard cert at `/etc/letsencrypt/live/duyet.vn/`
+  (verified 2026-05-12 — SAN `DNS:*.duyet.vn, DNS:duyet.vn`, valid until 2026-06-21).
+- nginx vhost references `ssl_certificate /etc/letsencrypt/live/duyet.vn/fullchain.pem;`
+  and `ssl_certificate_key /etc/letsencrypt/live/duyet.vn/privkey.pem;` directly.
+- Cert renewal is handled by an existing system-wide certbot renewal hook for
+  the `duyet.vn` cert — `tlinh.duyet.vn` rides on that. No per-host renewal
+  configuration needed for v2.
+- Step 6 of the deploy runbook MUST verify the cert exists and is valid (not
+  expired) before reloading nginx; abort the deploy if the cert is missing.
 
 ### 5.5 launchd (Mac)
 
@@ -839,37 +978,55 @@ If user wants finer granularity (e.g. every 6h), use `StartInterval` (seconds) i
 
 - Mac and Cowork sandbox both hit API server-side (not browser-side). No CORS preflight expected, but include permissive `Access-Control-Allow-*` on nginx anyway for future browser-based admin UI.
 
-### 7.4 Rate limiting (per Codex ISSUE-7 — exempt liveness + lock)
+### 7.4 Rate limiting (per Codex ISSUE-7 + ISSUE-15 + ISSUE-16 — Step 6 vhost is authoritative)
 
-Three buckets in nginx, keyed on `Authorization` header (or `$remote_addr` for health):
+Two leaky-bucket zones in nginx + one global hourly average zone. `/api/health`
+is **not** in any zone — health checks never 429.
 
-| Bucket | Endpoints | Limit | Burst |
-|---|---|---|---|
-| `tlinh_health` | `/api/health` | 60 req/min | 30 |
-| `tlinh_lock` | `/api/lock/*` (acquire, heartbeat, release) | 600 req/min | 100 |
-| `tlinh_main` | everything else | 100 req/min | 20 |
+| Zone | Endpoints | Average rate | Burst | Key |
+|---|---|---|---|---|
+| (none) | `/api/health` | unlimited | n/a | n/a |
+| `tlinh_lock` | `/api/lock/*` (acquire, heartbeat, release) | 600 req/min | 100 | `$http_authorization` |
+| `tlinh_main` | everything else under `/api/` (including `/api/admin/inject-test`) | 100 req/min | 20 | `$http_authorization` |
+| `tlinh_hourly` | every authed `/api/` endpoint, in addition to the per-zone limit above | **average** 1000 req/h | 50 | `$http_authorization` |
 
-**Rationale:** lock heartbeats run on every loop iteration; a 100-row score
-batch could easily emit 10+ heartbeats. Sharing the main bucket would cause
-spurious 429s on heartbeats, leading to lost lock ownership and aborted runs.
-Health checks must NEVER 429 (monitoring).
-
-Hard cap: 1000 req/hour combined per token (return 429 with `Retry-After: 60`).
+**Rationale:**
+- Lock heartbeats run on every loop iteration; a 100-row score batch could
+  easily emit 10+ heartbeats. Sharing the main bucket would cause spurious
+  429s on heartbeats, leading to lost lock ownership and aborted runs.
+- `/api/health` is for monitoring/oncall. It must NEVER 429. Step 6's vhost
+  enforces this by giving `/api/health` its own `location = /api/health`
+  block with no `limit_req` directive at all (verified by `nginx -T | grep
+  -A2 "= /api/health"`).
+- `tlinh_hourly` is a **leaky-bucket average rate limit**, NOT a fixed-window
+  hard cap (per Codex ISSUE-16). It admits up to `burst=50` over the average
+  rate, then queues/rejects. Sustained traffic above 1000 req/h sees 429s.
+  Short spikes inside the burst window do not 429. This is what nginx's
+  `limit_req` actually does — we do not advertise an exact 1000-count cap
+  because the implementation cannot guarantee one.
 
 **Caller behavior on 429:**
 - `/api/lock/*` callers: retry with backoff (1s, 2s, 4s). Do NOT treat 429 as
   lock loss — it is transient. Max 3 retries before giving up + abort run.
 - Other endpoints: retry once with 1s delay, then bubble up to caller.
+- All 429s include `Retry-After: 60` header (nginx vhost adds via `add_header`).
 
-nginx config snippet (will go in vhost):
+For the exact nginx directives, see §10 Step 6 vhost template — that is the
+authoritative source. The table above is descriptive; the snippet below is a
+condensed reference, NOT a replacement for the Step 6 template.
+
 ```nginx
-limit_req_zone $http_authorization zone=tlinh_main:10m rate=100r/m;
-limit_req_zone $http_authorization zone=tlinh_lock:10m rate=600r/m;
-limit_req_zone $binary_remote_addr  zone=tlinh_health:1m rate=60r/m;
+# Reference only — Step 6 is canonical.
+limit_req_zone $http_authorization zone=tlinh_main:10m   rate=100r/m;
+limit_req_zone $http_authorization zone=tlinh_lock:10m   rate=600r/m;
+limit_req_zone $http_authorization zone=tlinh_hourly:10m rate=1000r/h;
+limit_req_status 429;
 
-location /api/health         { limit_req zone=tlinh_health burst=30 nodelay; ... }
-location /api/lock/          { limit_req zone=tlinh_lock burst=100 nodelay; ... }
-location /api/                { limit_req zone=tlinh_main burst=20  nodelay; ... }
+location = /api/health { try_files $uri /index.php?$query_string; }  # NO limit_req
+location /api/lock/    { limit_req zone=tlinh_lock burst=100 nodelay;
+                         limit_req zone=tlinh_hourly burst=50 nodelay; ... }
+location /api/         { limit_req zone=tlinh_main burst=20 nodelay;
+                         limit_req zone=tlinh_hourly burst=50 nodelay; ... }
 ```
 
 ---
@@ -890,7 +1047,7 @@ FQDN="tlinh.duyet.vn"
 VPS_IP="14.225.29.159"
 ```
 
-### 8.2 Upsert A record (proxied=false for cert issuance)
+### 8.2 Upsert A record (proxied=false — direct-to-origin for operational simplicity)
 
 ```bash
 # 1. Look up existing record id
@@ -924,15 +1081,53 @@ for i in $(seq 1 30); do
 done
 ```
 
-### 8.3 Cert issuance via certbot
+### 8.3 Cert verification (no issuance — wildcard exists per user 2026-05-12)
 
 ```bash
-ssh vps-root "certbot --nginx -d ${FQDN} --non-interactive --agree-tos -m ${CF_EMAIL}"
-# certbot edits the nginx vhost in place and reloads.
-# Auto-renewal is handled by the existing system-wide systemd timer.
+# Wildcard cert for *.duyet.vn already exists on VPS at
+# /etc/letsencrypt/live/duyet.vn/. Step 6 nginx vhost references it directly.
+# We only VERIFY here — no `certbot` run.
+#
+# Per Codex ISSUE-25: nginx needs BOTH fullchain.pem AND privkey.pem, and they
+# MUST be the matching pair. We verify all FIVE properties before deploy:
+#   1. fullchain.pem exists.
+#   2. privkey.pem exists and is readable by the nginx user.
+#   3. SAN includes *.duyet.vn.
+#   4. Cert is not within 24h of expiry.
+#   5. fullchain.pem and privkey.pem are a matching pair, verified by comparing
+#      SHA-256 fingerprints of the DER-encoded public keys derived from each
+#      file (works for RSA and ECDSA — no modulus comparison).
+ssh vps-root '
+set -euo pipefail
+CERT=/etc/letsencrypt/live/duyet.vn/fullchain.pem
+KEY=/etc/letsencrypt/live/duyet.vn/privkey.pem
+
+[ -f "$CERT" ] || { echo "[fatal] wildcard cert missing at $CERT" >&2; exit 1; }
+[ -f "$KEY" ]  || { echo "[fatal] private key missing at $KEY" >&2; exit 1; }
+[ -r "$KEY" ]  || { echo "[fatal] private key not readable (check perms / sudo)" >&2; exit 1; }
+
+# Confirm SAN covers tlinh.duyet.vn (matches *.duyet.vn)
+openssl x509 -in "$CERT" -noout -ext subjectAltName | grep -q "DNS:\\*\\.duyet\\.vn" \
+  || { echo "[fatal] cert SAN does not include *.duyet.vn" >&2; exit 1; }
+
+# Confirm not expired (24h slack)
+openssl x509 -in "$CERT" -noout -checkend 86400 \
+  || { echo "[fatal] cert expires within 24h — renew before deploying" >&2; exit 1; }
+
+# Confirm fullchain and privkey are the matching pair.
+# We compare the SHA-256 fingerprint of each file's DER-encoded public key
+# (works for both RSA and ECDSA keys; no modulus comparison).
+CERT_FP=$(openssl x509 -in "$CERT" -noout -pubkey | openssl pkey -pubin -outform der | sha256sum | cut -d" " -f1)
+KEY_FP=$(openssl pkey -in "$KEY" -pubout -outform der | sha256sum | cut -d" " -f1)
+[ "$CERT_FP" = "$KEY_FP" ] || { echo "[fatal] fullchain.pem and privkey.pem do not match (pubkey fingerprint differs)" >&2; exit 1; }
+
+echo "[ok] wildcard cert valid and keypair matches"
+'
+# Renewal is handled by the existing system-wide certbot renew timer that
+# owns the duyet.vn certificate. tlinh.duyet.vn rides on that cert.
 ```
 
-### 8.4 Optional: flip proxied=true (after cert + 1 renewal cycle)
+### 8.4 Optional: flip proxied=true (deferred operational choice — cert already present)
 
 When enabling Cloudflare proxy in front of Let's Encrypt:
 - CF **SSL/TLS mode** must be set to **"Full (strict)"** (CF validates origin cert against Let's Encrypt CA). Setting "Flexible" or "Off" is INSECURE.
@@ -992,8 +1187,27 @@ Brainstorm: <code>/idea-brainstormer 42</code>
 - HTML parse mode (`parse_mode=HTML`).
 - `htmlspecialchars($title, ENT_QUOTES|ENT_HTML5, 'UTF-8')` on user-controlled fields.
 - 1.2s sleep between sends (per-chat rate limit ~1/sec).
-- 429 retry honoring `Retry-After` header.
+- 429 retry honoring `Retry-After` header (capped — see below).
 - 5xx: exponential backoff 1s/2s/4s/8s/16s, max 5 attempts.
+- Per-request HTTP timeout: 30s.
+
+**Retry-After cap (per Codex ISSUE-8):** if Telegram returns `Retry-After`
+greater than `NOTIFY_TELEGRAM_RETRY_AFTER_CAP_SECONDS` (default 60s), the
+server logs `notify.retry_after_exceeded_cap`, aborts the send, releases the
+claim (Phase 2 step 5), and returns 502. This prevents one slow Telegram
+response from holding a notify claim past the worst-case Phase 2 budget.
+
+**Worst-case Phase 2 budget = 5xx-backoff (31s) + retry-after cap (60s) +
+5 × request timeout (150s) = 241s.** The `NOTIFY_CLAIM_TTL_SECONDS` (default
+300s) is derived from this budget plus a 60s safety margin. See §4 `POST
+/api/notify/{id}` "Claim TTL sizing" for the full derivation.
+
+**Heartbeat during retries:** while Phase 2 is in flight (including sleeps
+between retries), a background task refreshes `notify_claimed_at` every
+`NOTIFY_CLAIM_HEARTBEAT_SECONDS` (default 20s) and aborts the send if the
+claim is stolen. So the stale-claim recovery rule can only fire when the
+owner has been silent for ≥ TTL seconds (~5 min), which only happens if the
+owning process actually died.
 
 Bootstrap test rows (`bootstrap-test://<TOKEN>`) include the token in the title prominently so user can visually verify which test message they received.
 
@@ -1001,13 +1215,26 @@ Bootstrap test rows (`bootstrap-test://<TOKEN>`) include the token in the title 
 
 ## 10. Deployment runbook (one-time, reproducible)
 
-**Per Codex ISSUE-5:** every step is run from a single local Mac shell session
-that exports `deploy.env`. Run `bash scripts/deploy.sh` (Task 8) to execute
-end-to-end automatically, OR follow the steps below manually.
+**Per Codex ISSUE-5 + ISSUE-12:** the runbook is split into two phases:
 
-All commands assume `set -euo pipefail`. Reruns are safe (every step is
-idempotent — folder creation, DB user, DNS record, nginx vhost, certbot all
-short-circuit if already done).
+- **Phase A — Infrastructure deploy (automated):** `bash scripts/deploy.sh`
+  executes Steps 1–9 (DNS, VPS folders, code upload, DB, .env, nginx + cert verify,
+  health check, Mac client) without manual intervention. Idempotent.
+- **Phase B — Cowork verify (manual one-time):** Steps 10–13 require manual
+  Claude Desktop UI clicks. We seed a bootstrap test row via SSH-tunneled
+  `POST /api/admin/inject-test` (deterministic — guarantees the pipeline has
+  a notify-eligible row before "Run now") and then verify Telegram receipt.
+
+AC #15 covers Phase A's automation. AC #11 covers Phase B's verification.
+Re-running Phase A is safe (every step is idempotent — folder creation, DB
+user, DNS record, nginx vhost all short-circuit if already done; cert is pre-issued — Step 6 only verifies validity).
+
+All commands assume `set -euo pipefail`. Phase A runs from a single local Mac
+shell session that exports `deploy.env`.
+
+---
+
+### Phase A — Infrastructure deploy (`scripts/deploy.sh`)
 
 ### Pre-step — Gather inputs into `deploy.env`
 
@@ -1070,18 +1297,32 @@ bash scripts/dns_setup.sh   # implements §8.2 upsert logic; idempotent
 # After return: DNS has tlinh.duyet.vn → 14.225.29.159, proxied=false, propagated.
 ```
 
-### Step 2 — Upload code + schema to VPS
+### Step 2 — Create VPS target directories (idempotent, MUST run before Step 3 rsync — per Codex ISSUE-11)
 
 ```bash
-# Rsync code (idempotent)
+# Directories MUST exist before rsync uploads into them. This step is split out
+# from the DB/schema work in old Step 3 so the runbook is correctly sequenced
+# on a fresh VPS.
+ssh "${VPS_SSH_ALIAS}" "bash -s" << 'REMOTE'
+set -euo pipefail
+mkdir -p /var/www/tlinh/tlinh.duyet.vn/releases/v1/{public,src/routes}
+mkdir -p /var/www/tlinh/tlinh.duyet.vn/shared
+chown -R www-data:www-data /var/www/tlinh
+REMOTE
+```
+
+### Step 3 — Upload code + schema to VPS
+
+```bash
+# Rsync code (idempotent — target dirs created in Step 2)
 rsync -avz --delete --exclude='.git' --exclude='__pycache__' \
   vps/ "${VPS_SSH_ALIAS}":/var/www/tlinh/tlinh.duyet.vn/releases/v1/
 
-# Upload schema.sql separately so Step 3 can find it
+# Upload schema.sql separately so Step 4 can find it
 scp vps/schema.sql "${VPS_SSH_ALIAS}":/tmp/schema.sql
 ```
 
-### Step 3 — VPS folder + DB user + schema (idempotent)
+### Step 4 — DB user + schema (idempotent)
 
 ```bash
 # Use ssh -T with heredoc and inject variables explicitly. NO bash here-string
@@ -1090,9 +1331,6 @@ scp vps/schema.sql "${VPS_SSH_ALIAS}":/tmp/schema.sql
 
 ssh "${VPS_SSH_ALIAS}" "DB_PASS='${DB_PASS}' bash -s" << 'REMOTE'
 set -euo pipefail
-mkdir -p /var/www/tlinh/tlinh.duyet.vn/{releases/v1/public,releases/v1/src/routes,shared}
-chown -R www-data:www-data /var/www/tlinh
-
 # MariaDB root socket-auth (works on Ubuntu's default debian-sys-maint setup).
 # If your VPS root user has a password, switch to that auth here.
 mariadb -u root <<SQL
@@ -1108,7 +1346,7 @@ mariadb -u tlinh -p"${DB_PASS}" tlinh_news < /tmp/schema.sql
 REMOTE
 ```
 
-### Step 4 — Write VPS `.env`
+### Step 5 — Write VPS `.env`
 
 ```bash
 ssh "${VPS_SSH_ALIAS}" "API_TOKEN='${API_TOKEN}' DB_PASS='${DB_PASS}' \
@@ -1127,7 +1365,10 @@ TELEGRAM_CHAT_ID=${TG_CHAT_ID}
 TITLE_DEDUP_WINDOW_HOURS=48
 MAX_RETRIES=3
 LOCK_TTL_SECONDS=1800
-NOTIFY_CLAIM_TTL_SECONDS=60
+NOTIFY_CLAIM_TTL_SECONDS=300
+NOTIFY_CLAIM_HEARTBEAT_SECONDS=20
+NOTIFY_TELEGRAM_RETRY_AFTER_CAP_SECONDS=60
+NOTIFY_TELEGRAM_REQUEST_TIMEOUT_SECONDS=30
 MIN_SCORE_TO_NOTIFY=3
 MAX_ARTICLES_PER_LIST=50
 EOF
@@ -1141,7 +1382,7 @@ chown -R www-data:www-data /var/www/tlinh
 REMOTE
 ```
 
-### Step 5 — nginx vhost + Let's Encrypt cert (idempotent)
+### Step 6 — nginx vhost (uses existing wildcard cert; idempotent — per Codex ISSUE-9, ISSUE-10 + 2026-05-12 wildcard pivot)
 
 ```bash
 ssh "${VPS_SSH_ALIAS}" "FQDN='${FQDN}' CF_EMAIL='${CF_EMAIL}' bash -s" << 'REMOTE'
@@ -1151,27 +1392,75 @@ VHOST=/etc/nginx/sites-available/"${FQDN}"
 # Write only if missing or differs (idempotent)
 TMPF=$(mktemp)
 cat > "${TMPF}" <<NGINX
+# Rate-limit zones (per Codex ISSUE-10)
 limit_req_zone \$http_authorization zone=tlinh_main:10m   rate=100r/m;
 limit_req_zone \$http_authorization zone=tlinh_lock:10m   rate=600r/m;
-limit_req_zone \$binary_remote_addr  zone=tlinh_health:1m rate=60r/m;
+# Global: every 429 carries Retry-After: 60 and is returned with HTTP 429 (not the default 503)
+limit_req_status 429;
 
+# 1000 req/hour combined per token, enforced via a parallel zone with longer
+# bucket. Burst handles short spikes; sustained traffic above the rate is 429'd.
+limit_req_zone \$http_authorization zone=tlinh_hourly:10m rate=1000r/h;
+
+# Add Retry-After: 60 to all 429 responses. (\$limit_req_status is non-empty only on 429.)
+map \$status \$retry_after_header { 429 "60"; default ""; }
+
+# HTTP → HTTPS redirect (cert covers all of *.duyet.vn — no acme-challenge needed)
 server {
     listen 80;
+    server_name ${FQDN};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
     server_name ${FQDN};
     root /var/www/tlinh/${FQDN}/current/public;
     index index.php;
     client_max_body_size 5M;
 
-    location /api/health {
-        limit_req zone=tlinh_health burst=30 nodelay;
+    # Existing wildcard cert (NO certbot run during deploy — per user 2026-05-12)
+    ssl_certificate     /etc/letsencrypt/live/duyet.vn/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/duyet.vn/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    # Security headers (per §5.4 promise + Codex ISSUE-28)
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options        "DENY" always;
+    add_header Referrer-Policy        "strict-origin-when-cross-origin" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    add_header Retry-After \$retry_after_header always;
+
+    # Health: NEVER rate-limited (monitoring). Per Codex ISSUE-10.
+    location = /api/health {
+        # No limit_req here on purpose. AC #14 requires 100 health checks in
+        # 60s to always return 200. Health is cheap (PING + 200), no auth.
         try_files \$uri /index.php?\$query_string;
     }
+
+    # Localhost-only admin endpoint (per Codex ISSUE-9). Bearer is still
+    # required at the PHP layer, but nginx rejects non-loopback callers FIRST.
+    location = /api/admin/inject-test {
+        allow 127.0.0.1;
+        allow ::1;
+        deny all;
+        # Still subject to main bucket (avoids local script loop runaway).
+        limit_req zone=tlinh_main burst=20 nodelay;
+        limit_req zone=tlinh_hourly burst=50 nodelay;
+        try_files \$uri /index.php?\$query_string;
+    }
+
     location /api/lock/ {
         limit_req zone=tlinh_lock burst=100 nodelay;
+        limit_req zone=tlinh_hourly burst=50 nodelay;
         try_files \$uri /index.php?\$query_string;
     }
     location /api/ {
         limit_req zone=tlinh_main burst=20 nodelay;
+        limit_req zone=tlinh_hourly burst=50 nodelay;
         try_files \$uri /index.php?\$query_string;
     }
     location / { try_files \$uri \$uri/ /index.php?\$query_string; }
@@ -1187,6 +1476,22 @@ server {
 }
 NGINX
 
+# Verify wildcard cert + private key BEFORE writing/reloading nginx (per Codex ISSUE-25).
+# nginx requires BOTH files and they MUST be the matching pair.
+CERT=/etc/letsencrypt/live/duyet.vn/fullchain.pem
+KEY=/etc/letsencrypt/live/duyet.vn/privkey.pem
+[ -f "$CERT" ] || { echo "[fatal] wildcard cert missing at $CERT — recovery: SSH to VPS as root and re-run the existing certbot DNS-01 flow for *.duyet.vn, e.g. 'certbot certonly --manual --preferred-challenges dns -d \"*.duyet.vn\" -d duyet.vn' (or whatever flow originally issued the cert). This deploy script does NOT issue certs; cert lifecycle is owned outside v2." >&2; rm -f "${TMPF}"; exit 1; }
+[ -f "$KEY" ]  || { echo "[fatal] private key missing at $KEY" >&2; rm -f "${TMPF}"; exit 1; }
+[ -r "$KEY" ]  || { echo "[fatal] private key not readable (check perms / sudo)" >&2; rm -f "${TMPF}"; exit 1; }
+openssl x509 -in "$CERT" -noout -ext subjectAltName | grep -q 'DNS:\*\.duyet\.vn' \
+  || { echo "[fatal] cert SAN does not include *.duyet.vn" >&2; rm -f "${TMPF}"; exit 1; }
+openssl x509 -in "$CERT" -noout -checkend 86400 \
+  || { echo "[fatal] cert expires within 24h — renew before deploying" >&2; rm -f "${TMPF}"; exit 1; }
+# Pubkey-fingerprint match (works for RSA + EC keys)
+CERT_FP=$(openssl x509 -in "$CERT" -noout -pubkey | openssl pkey -pubin -outform der | sha256sum | cut -d' ' -f1)
+KEY_FP=$(openssl pkey -in "$KEY" -pubout -outform der | sha256sum | cut -d' ' -f1)
+[ "$CERT_FP" = "$KEY_FP" ] || { echo "[fatal] fullchain.pem and privkey.pem do not match" >&2; rm -f "${TMPF}"; exit 1; }
+
 if ! cmp -s "${TMPF}" "${VHOST}" 2>/dev/null; then
   mv "${TMPF}" "${VHOST}"
   ln -sfn "${VHOST}" /etc/nginx/sites-enabled/"${FQDN}"
@@ -1194,22 +1499,20 @@ if ! cmp -s "${TMPF}" "${VHOST}" 2>/dev/null; then
 else
   rm -f "${TMPF}"
 fi
-
-# Cert: only issue if not present
-if [ ! -d /etc/letsencrypt/live/"${FQDN}" ]; then
-  certbot --nginx -d "${FQDN}" --non-interactive --agree-tos -m "${CF_EMAIL}"
-fi
+# NOTE: no certbot run — wildcard *.duyet.vn cert is already issued at
+# /etc/letsencrypt/live/duyet.vn/. Renewal is owned by the existing
+# system-wide certbot renew timer for that cert.
 REMOTE
 ```
 
-### Step 6 — Health check
+### Step 7 — Health check
 
 ```bash
 curl -fsSL "https://${FQDN}/api/health"
 # Expected: {"status":"ok","db":"connected","version":"v2-..."}
 ```
 
-### Step 7 — Mac client
+### Step 8 — Mac client
 
 ```bash
 cd /Users/theduyet/Documents/Code/vin-automate
@@ -1227,26 +1530,6 @@ chmod 600 .env
 # Expected: {'status': 'ok', 'db': 'connected', ...}
 ```
 
-### Step 8 — Cowork-side `SKILLS/.env`
-
-```bash
-# Cowork sources this file as the only API_TOKEN path (see §5.3 mandate).
-# Same token as Mac, separate file for blast-radius isolation.
-cat > SKILLS/.env <<EOF
-API_BASE_URL=https://${FQDN}
-API_TOKEN=${API_TOKEN}
-EOF
-chmod 600 SKILLS/.env
-echo 'SKILLS/.env' >> .gitignore  # ensure ignored
-
-# In Claude Desktop:
-# 1. Create Cowork project pointing at this folder.
-# 2. Grant bash + network "Allow all".
-# 3. Open Cowork chat, paste `cowork-task-prompt.md` content into `/schedule` UI.
-#    Set frequency: Daily. Name: vinfast-pipeline. Save.
-# 4. Click "Run now" to verify end-to-end. Telegram receives test message.
-```
-
 ### Step 9 — launchd (Mac daily crawl)
 
 ```bash
@@ -1261,7 +1544,114 @@ launchctl kickstart -k "gui/$(id -u)/com.tlinh.crawl"  # immediate trigger
 tail logs/crawl.out
 ```
 
-### Step 10 — Delete `deploy.env` (cleanup)
+### Step 9.end — Phase A complete
+
+After Step 9, `scripts/deploy.sh` exits 0. Infrastructure is live, DNS+TLS
+resolve, Mac launchd is running. **At this point no Telegram message has
+been sent yet — that requires Phase B below.**
+
+---
+
+### Phase B — Cowork verify (manual one-time)
+
+**Pre-step — Re-source `deploy.env` into the current shell (per Codex ISSUE-17).**
+Phase A ran inside `bash scripts/deploy.sh` (a subshell), so its exported
+variables are NOT in the operator's interactive shell when Phase A returns.
+Phase B commands reference `${VPS_SSH_ALIAS}`, `${FQDN}`, `${API_TOKEN}`,
+`${DB_PASS}` — these MUST be re-loaded before continuing:
+
+```bash
+# In the SAME terminal where Phase A was run (deploy.env still on disk):
+set -a
+. deploy.env
+set +a
+
+# Sanity:
+: "${VPS_SSH_ALIAS?}" "${FQDN?}" "${API_TOKEN?}" "${DB_PASS?}"
+```
+
+If `deploy.env` was deleted or you opened a new terminal, regenerate it from
+secrets you saved elsewhere — there is no way to recover `API_TOKEN` from the
+VPS (it's hashed-compared, not extractable). `DB_PASS` can be reset via
+`mariadb -u root` if lost; `API_TOKEN` requires regenerating both VPS and
+client-side .env files.
+
+These steps require manual Claude Desktop UI clicks and cannot be automated
+by `deploy.sh` (Cowork project creation and `/schedule` saves are UI-only).
+
+### Step 10 — Cowork-side `SKILLS/.env`
+
+```bash
+# Cowork sources this file as the only API_TOKEN path (see §5.3 mandate).
+# Same token as Mac, separate file for blast-radius isolation.
+cat > SKILLS/.env <<EOF
+API_BASE_URL=https://${FQDN}
+API_TOKEN=${API_TOKEN}
+EOF
+chmod 600 SKILLS/.env
+echo 'SKILLS/.env' >> .gitignore  # ensure ignored
+```
+
+### Step 11 — Cowork project + scheduled task (manual UI clicks)
+
+In Claude Desktop:
+1. Create Cowork project pointing at `vin-automate` folder.
+2. Grant bash + network "Allow all".
+3. Open Cowork chat, paste `cowork-task-prompt.md` content into `/schedule` UI.
+4. Set frequency: **Daily**. Name: `vinfast-pipeline`. Save.
+
+Do NOT click "Run now" yet — Step 12 first seeds a verifiable test row.
+
+### Step 12 — Seed bootstrap test row via SSH-tunneled inject-test (per Codex ISSUE-12)
+
+The admin endpoint is localhost-only at nginx level (Step 6 vhost). We tunnel
+from Mac to VPS loopback to seed exactly one verifiable row:
+
+```bash
+# Pick a unique hex token for this verification run
+BOOTSTRAP_TOKEN=$(openssl rand -hex 8)
+echo "Verification token: ${BOOTSTRAP_TOKEN}"  # USER: copy this — Telegram message must contain it
+
+# Open SSH tunnel: local 18443 → VPS 127.0.0.1:443 (nginx loopback)
+# Run in background; the trap kills it on exit.
+ssh -f -N -L 18443:127.0.0.1:443 "${VPS_SSH_ALIAS}"
+TUNNEL_PID=$(pgrep -f "ssh -f -N -L 18443:127.0.0.1:443 ${VPS_SSH_ALIAS}" | head -1)
+trap 'kill ${TUNNEL_PID} 2>/dev/null || true' EXIT
+
+# POST through the tunnel. -k (insecure) because we connect via tunnel
+# but nginx's cert is for tlinh.duyet.vn — set Host header explicitly so
+# nginx routes to the right vhost. The 127.0.0.1 source IP is what
+# satisfies the nginx allow 127.0.0.1; deny all rule for /api/admin/.
+curl -fsSk -X POST "https://127.0.0.1:18443/api/admin/inject-test" \
+  -H "Host: ${FQDN}" \
+  -H "Authorization: Bearer ${API_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --resolve "${FQDN}:18443:127.0.0.1" \
+  -d "{\"token\":\"${BOOTSTRAP_TOKEN}\"}"
+
+# Expected: 201 {"id":N,"created":true,"url":"bootstrap-test://<TOKEN>","score":5}
+# Verify pre-Cowork state: row exists with score=5, notified_at=NULL.
+```
+
+### Step 13 — Click "Run now" + verify Telegram
+
+1. In the Cowork UI for `vinfast-pipeline`, click **Run now**.
+2. Wait up to 10 minutes for the scheduled task to acquire the lock, fetch
+   the bootstrap row (first by ORDER BY priority), POST `/api/notify/{id}`,
+   and send to Telegram.
+3. **Expected:** Telegram receives a message containing `${BOOTSTRAP_TOKEN}`
+   in the title (HTML-escaped). The token in the user's terminal MUST match
+   the token in the message — that proves the verification row is the
+   actually-notified row.
+4. **DB check:**
+   ```bash
+   ssh "${VPS_SSH_ALIAS}" mariadb -u tlinh -p"${DB_PASS}" tlinh_news \
+     -e "SELECT id, notified_at, telegram_msg_id FROM articles \
+         WHERE url = 'bootstrap-test://${BOOTSTRAP_TOKEN}'"
+   # notified_at NOT NULL, telegram_msg_id NOT NULL
+   ```
+
+### Step 14 — Delete `deploy.env` (cleanup)
 
 ```bash
 shred -u deploy.env  # local cleanup of secrets
@@ -1284,7 +1674,7 @@ Tasks ordered by dependency. Each task = 1 commit, reviewed by Codex.
 | 5 | Lock endpoints | `vps/src/routes/lock.php` (acquire/heartbeat/release) | 409 on concurrent acquire; TTL reclaim works; expired-lock cleanup log line |
 | 6 | **Notify endpoint with 2-phase claim** (per Codex ISSUE-1) | `vps/src/routes/notify.php`, `vps/src/Telegram.php` | Phase 1 atomic claim via UPDATE returns 1; concurrent callers second one gets rowcount=0 → no Telegram send; stale-claim recovery via TTL works; HTML escape on title verified |
 | 7 | Hashing helpers + URL canonicalization | `vps/src/Hashing.php` | url_hash matches Python output on identical canonical inputs (cross-test with Mac client) |
-| 8 | Deploy script + nginx vhost template (idempotent end-to-end) | `scripts/deploy.sh`, `vps/nginx-tlinh.conf.tpl` | `bash scripts/deploy.sh` succeeds twice in a row without errors; second run reports all steps no-op; secrets cleaned up |
+| 8 | Phase A deploy script + nginx vhost template (idempotent Steps 1–9 per ISSUE-12 + ISSUE-18) | `scripts/deploy.sh`, `vps/nginx-tlinh.conf.tpl` | `bash scripts/deploy.sh` succeeds twice in a row without errors; second run reports all steps no-op. **deploy.env is NOT shredded by this script** — it must survive into Phase B (operator-driven `shred -u` at Step 14). Script does NOT call Cowork UI, NOT seed inject-test. |
 | 8a | **Telegram nonce helper** | `scripts/telegram-nonce-helper.sh` | Collects bot token + chat_id via deterministic nonce flow; writes to `deploy.env` |
 | 9 | DNS automation (idempotent upsert + SSL mode guard per ISSUE-6) | `scripts/dns_setup.sh` | First run creates record; second run no-op or PATCH; refuses to enable proxy if CF SSL mode != strict/full |
 | 10 | Mac `api_client.py` (httpx wrapper + retry + 429 handling per ISSUE-7) | `api_client.py` | Unit test: round-trip POST + GET works on staging VPS; 429 retry with backoff |
@@ -1339,9 +1729,14 @@ If `POST /notify` succeeds Phase 1 (claim) but the Telegram API call fails perma
 
 A subsequent `POST /notify/{id}` then succeeds Phase 1 again (claim re-available) and retries.
 
-### AC #5b — Stale claim recovery
+### AC #5b — Stale claim recovery (per Codex ISSUE-8)
 
-If a claim row has `notify_claimed_at < NOW() - NOTIFY_CLAIM_TTL_SECONDS` (default 60s) AND `notified_at IS NULL`, the next `POST /notify/{id}` clears the stale claim opportunistically and proceeds to Phase 1 normally. Verified by `INSERT INTO articles ... notify_claimed_at = NOW() - INTERVAL 120 SECOND` then triggering `POST /notify/{id}` and confirming new claim succeeds.
+`NOTIFY_CLAIM_TTL_SECONDS` (default 300s) is sized to bound the worst-case Phase 2 budget (Telegram retry backoff + `Retry-After` cap + 5 × request timeout = 241s) plus 60s safety. A live owner refreshes `notify_claimed_at` every `NOTIFY_CLAIM_HEARTBEAT_SECONDS` (default 20s) for the entire Phase 2 duration, including sleeps between retries.
+
+- **Live-owner safety:** Simulate a slow Telegram by mocking `sendMessage` to sleep 200s. During the sleep, run a second `POST /notify/{id}` from another connection. The second caller's Phase 1 atomic claim fails (`rowcount = 0`) because `notify_claimed_at` is still fresh from heartbeats. Expected: only ONE Telegram send occurs.
+- **Dead-owner reclaim:** Kill the PHP worker mid-send (no heartbeats). Wait > `NOTIFY_CLAIM_TTL_SECONDS`. Trigger `POST /notify/{id}` again. Expected: stale-claim recovery clears the abandoned claim and the new caller succeeds Phase 1.
+- **Retry-After cap:** Mock Telegram to return `429 Retry-After: 9999`. Expected: server logs `notify.retry_after_exceeded_cap`, releases claim, calls `/fail` with `stage=notify`, returns 502. No claim is held past TTL.
+- **Boot validation:** Set `NOTIFY_CLAIM_HEARTBEAT_SECONDS=200` and `NOTIFY_CLAIM_TTL_SECONDS=60` in `.env`. Server boot fails with explicit message `[fatal] NOTIFY_CLAIM_TTL_SECONDS must be ≥ 3 × NOTIFY_CLAIM_HEARTBEAT_SECONDS AND ≥ NOTIFY_PHASE2_BUDGET_SECONDS + 60`.
 
 ### AC #6 — HTTPS + bearer auth
 
@@ -1368,21 +1763,23 @@ Inject row via admin endpoint with `bootstrap-test://<TOKEN>`. `GET /api/article
 
 Title containing `<b>&*_[]</b>` → server escapes via `htmlspecialchars`; Telegram receives 200 OK, message renders without error.
 
-### AC #11 — Bootstrap verification flow
+### AC #11 — Bootstrap verification flow (per ISSUE-3 + ISSUE-12)
 
-1. `POST /api/admin/inject-test {"token": "abc123def456"}` from localhost on VPS (per ISSUE-3 spec).
-2. Click "Run now" on Cowork scheduled task.
-3. Within 10 min, Telegram receives message containing `abc123def456` literally (HTML-escaped title).
-4. DB: row with `url=bootstrap-test://abc123def456` has `notified_at NOT NULL`.
-5. Re-running `POST /api/admin/inject-test` with same token: returns existing row id (idempotent, no duplicate).
+1. **Seed (Step 12 of runbook):** From Mac, open SSH tunnel `ssh -L 18443:127.0.0.1:443 vps-root`, then `curl -X POST https://127.0.0.1:18443/api/admin/inject-test` with `Host: tlinh.duyet.vn`, `--resolve tlinh.duyet.vn:18443:127.0.0.1`, bearer token, and JSON body `{"token": "abc123def456"}`. The 127.0.0.1 source satisfies the nginx `allow 127.0.0.1; deny all` rule.
+2. **Non-localhost rejected:** From Mac directly (no tunnel), `curl -X POST https://tlinh.duyet.vn/api/admin/inject-test ...` returns 403 (nginx deny).
+3. Click "Run now" on Cowork scheduled task (Step 13).
+4. Within 10 min, Telegram receives message containing `abc123def456` literally (HTML-escaped title).
+5. DB: row with `url=bootstrap-test://abc123def456` has `notified_at NOT NULL` and `telegram_msg_id NOT NULL`.
+6. Re-running Step 1 with same token: returns existing row id (idempotent, no duplicate, `created: false`).
 
-### AC #12 — Fail/retry semantics (per ISSUE-2)
+### AC #12 — Fail/retry semantics (per ISSUE-2 + ISSUE-13)
 
 1. Trigger extract on an unreachable URL → `extract.py` retries in-process up to `MAX_RETRIES` then calls `POST /api/articles/{id}/fail` with `stage=extract`.
-2. DB: `retry_count = 1`, `failed_at` set, `last_error` populated.
-3. Next scheduled run picks up the same row (because `extracted_at IS NULL` and `retry_count < MAX_RETRIES`); fails again → `retry_count = 2`.
-4. After `MAX_RETRIES` failed runs: `final_state = 'discarded'`. Row never re-attempted.
-5. Manual recovery: `mark.py archive <id>` or direct SQL.
+2. DB: `retry_count = 1`, `failed_at` set, `last_error` populated. Row is STILL in `stage=new` because `retry_count < MAX_RETRIES AND final_state IS NULL`.
+3. Next scheduled run's `GET /api/articles?stage=new` returns the same row (predicate per §4); extract fails again → `retry_count = 2`.
+4. After `MAX_RETRIES` failed calls: server sets `final_state = 'discarded'`. **The discarded row is excluded from `stage=new` by predicate** (`final_state IS NULL` fails). Row never re-attempted by any client.
+5. Verify exclusion: `GET /api/articles?stage=new` after discard returns no row for that id. `GET /api/articles?final_state=discarded` returns it.
+6. Manual recovery: direct SQL via VPS shell, e.g. `UPDATE articles SET final_state = NULL, retry_count = 0, failed_at = NULL, last_error = NULL WHERE id = ?` to put a discarded row back into the queue. (No `mark.py` tool — that was v1 and is removed in v2.)
 
 ### AC #13 — Single auth path enforced (per ISSUE-4)
 
@@ -1390,17 +1787,32 @@ Title containing `<b>&*_[]</b>` → server escapes via `htmlspecialchars`; Teleg
 - Hardcoded `API_TOKEN` in any committed skill file or task prompt → CI/manual grep `grep -rE 'API_TOKEN=[a-f0-9]{16,}'` returns zero matches.
 - `SKILLS/.env` is in `.gitignore`. Verified by `git check-ignore SKILLS/.env`.
 
-### AC #14 — Rate limiting does not break heartbeat (per ISSUE-7)
+### AC #14 — Rate limiting does not break heartbeat (per ISSUE-7 + ISSUE-15 + ISSUE-16)
 
-- Send 100+ heartbeats in 60 seconds. None receive 429.
+- **Heartbeats:** Send 100+ heartbeats (`/api/lock/<name>/heartbeat`) in 60 seconds. None receive 429. (Lock bucket: 600 req/min + burst 100.)
 - Verify by simulating a long-running score loop with `HEARTBEAT_EVERY_N_ROWS=1` (one heartbeat per row) over 100 rows in 60s.
-- `/api/health` always 200 regardless of token activity.
+- **Health unlimited:** Send 1000 `/api/health` requests in 60s. None receive 429. Verify nginx config has `location = /api/health` with NO `limit_req` directive: `nginx -T | awk '/location = \/api\/health/,/^[[:space:]]*}$/'` must not contain `limit_req`.
+- **Hourly leaky-bucket — paced load (per Codex ISSUE-20):** `/api/` paths are subject to BOTH `tlinh_main` (100 req/min + burst 20) and `tlinh_hourly` (1000 req/h ≈ 16.67 req/min + burst 50). A 1100-in-60s burst trips `tlinh_main` first and does not isolate `tlinh_hourly`. To verify the hourly zone independently, send a paced load that stays below the main bucket but exceeds the hourly bucket: **send 50 `/api/articles` requests per minute for 20 minutes** (total 1000 requests). Expected:
+  - `tlinh_main` never trips (50/min < 100/min cap; well within steady-state).
+  - `tlinh_hourly` admits burst (50) immediately, then drains at 16.67/min. Sustained 50/min exceeds drain rate → after ~3–4 minutes, `tlinh_hourly` is empty and subsequent requests receive 429 with `Retry-After: 60`.
+  - Approximately the first 50 + (16.67 × 20) ≈ 383 requests succeed; the remaining ~617 receive 429. (Exact count depends on nginx's worker timing; the AC only asserts directional behavior, not an exact pass/fail count.)
+  - The test passes if: (a) zero 429s came from `tlinh_main` (check `nginx error_log` for `limiting requests, excess: ... by zone "tlinh_main"`); (b) at least 200 requests received 429 attributed to `tlinh_hourly`.
+- **429 envelope:** Every 429 response has `Retry-After: 60` (`curl -i ... | grep -i retry-after`).
 
-### AC #15 — Deploy runbook is reproducible (per ISSUE-5)
+### AC #15 — Deploy runbook is reproducible (per ISSUE-5 + ISSUE-12 + ISSUE-17 + ISSUE-18)
 
-- Fresh VPS (or after `rm -rf /var/www/tlinh`): `bash scripts/deploy.sh` completes end-to-end with no manual intervention.
+**Phase A (automated):**
+- Fresh VPS (or after `rm -rf /var/www/tlinh`): `bash scripts/deploy.sh` completes Steps 1–9 (DNS, VPS folders, code upload, DB, .env, nginx vhost + wildcard-cert preflight, health check, Mac client, launchd) with no manual intervention. Exits 0. **No certbot run** — wildcard `*.duyet.vn` cert is pre-installed. Step 6 preflight (per Codex ISSUE-25) aborts BEFORE writing the vhost or reloading nginx if any of these fail: (a) `fullchain.pem` missing, (b) `privkey.pem` missing or unreadable, (c) cert SAN does not include `*.duyet.vn`, (d) cert within 24h of expiry, (e) cert and key are not a matching pair (pubkey-fingerprint mismatch).
 - Second run of `bash scripts/deploy.sh`: every step short-circuits as "already done". Exits 0.
-- `deploy.env` is deleted at end via `shred -u`.
+- After Phase A: `curl https://${FQDN}/api/health` returns 200; Mac launchd shows the job loaded; no Telegram message has been sent yet (intentional).
+- **`deploy.env` is NOT shredded at end of Phase A.** It must persist on Mac disk so the operator can re-source it for Phase B (`set -a; . deploy.env; set +a`). Verify: after `bash scripts/deploy.sh`, `ls -la deploy.env` returns the file with mode `600`.
+
+**Phase B (manual one-time, covered by AC #11):**
+- The Cowork project creation, `/schedule` save, and "Run now" click are UI actions that `deploy.sh` cannot perform. The runbook lists them as Steps 10–13.
+- The SSH-tunneled `inject-test` (Step 12) seeds the verifiable row deterministically. AC #11 verifies end-to-end Telegram receipt.
+
+**Cleanup:**
+- `deploy.env` is deleted at end via `shred -u` (Step 14).
 
 ### AC #16 — DNS automation is idempotent (per ISSUE-6)
 
@@ -1425,13 +1837,18 @@ Title containing `<b>&*_[]</b>` → server escapes via `htmlspecialchars`; Teleg
 | 8 | Priority sort | Inject bootstrap-test row + 50 real rows | GET articles returns bootstrap-test first. |
 | 9 | TTL reclaim | acquire ttl=1, sleep 2, acquire | 2nd succeeds, new owner_id, locks count = 1. |
 | 10 | HTML escape | Inject article with title `<b>&*_[]</b>` | Telegram receives 200. Visual: tag rendered as text. |
-| 11 | Bootstrap end-to-end | Inject `bootstrap-test://abc123def456` + Run now Cowork | Telegram message contains "abc123def456" within 10 min. notified_at set. Re-inject same token → existing row id returned, no duplicate. |
+| 11 | Bootstrap end-to-end (SSH-tunneled — ISSUE-12) | Mac: `ssh -L 18443:127.0.0.1:443 vps-root` then `curl -k -X POST https://127.0.0.1:18443/api/admin/inject-test -H "Host: tlinh.duyet.vn" --resolve tlinh.duyet.vn:18443:127.0.0.1 -d '{"token":"abc123def456"}'`; then Run now Cowork | 201 created. Direct `curl https://tlinh.duyet.vn/api/admin/inject-test` from Mac WITHOUT tunnel returns 403 (nginx deny). Telegram message contains "abc123def456" within 10 min. notified_at set. Re-inject same token → existing row id returned, no duplicate. |
 | 5a | Notify 2-phase under failure | Force Telegram 400 (e.g. bad chat_id env override): POST /notify/{id} | Phase 1 claims, Telegram fails 400 → claim released (`notify_claimed_at=NULL`), /fail called (retry_count++), HTTP 502 returned to caller. Subsequent POST succeeds Phase 1 again. |
-| 5b | Stale claim recovery | `INSERT INTO articles ... notify_claimed_at = NOW() - INTERVAL 120 SECOND, notify_claim_owner='abc'`; then POST /notify/{id} | Stale claim cleared opportunistically. New claim succeeds. notified_at populated. |
-| 12 | Fail/retry → discard | Mock httpx transient error N+1 times; trigger N extract runs | After MAX_RETRIES (default 3) failed runs: row's final_state='discarded'. Next extract run skips this row (filter `final_state IS NULL`). |
+| 5b-live | Live-owner heartbeat (ISSUE-8) | Mock `sendMessage` to sleep 200s; concurrent POST /notify/{id} from second connection during sleep | Second caller's Phase 1 returns rowcount=0 (notify_claimed_at still fresh from heartbeats). Only ONE Telegram send. |
+| 5b-dead | Dead-owner reclaim (ISSUE-8) | Kill PHP worker mid-send (heartbeats stop). Wait > NOTIFY_CLAIM_TTL_SECONDS (300s default). POST /notify/{id} again. | Stale-claim recovery clears abandoned claim. New caller succeeds Phase 1. notified_at populated. |
+| 5b-cap | Retry-After cap (ISSUE-8) | Mock Telegram to return `429 Retry-After: 9999` | Server logs `notify.retry_after_exceeded_cap`, releases claim, calls /fail with stage=notify, returns 502. Claim NOT held past TTL. |
+| 5b-boot | TTL/heartbeat boot validation (ISSUE-8) | Set `NOTIFY_CLAIM_HEARTBEAT_SECONDS=200` and `NOTIFY_CLAIM_TTL_SECONDS=60` in `.env`, restart php-fpm | Boot fails with `[fatal] NOTIFY_CLAIM_TTL_SECONDS must be ≥ 3 × NOTIFY_CLAIM_HEARTBEAT_SECONDS AND ≥ NOTIFY_PHASE2_BUDGET_SECONDS + 60`. |
+| 12 | Fail/retry → discard exclusion (ISSUE-13) | Mock httpx transient error N+1 times; trigger N extract runs | After MAX_RETRIES (default 3) failed runs: row's final_state='discarded'. `GET /api/articles?stage=new` (predicate `extracted_at IS NULL AND final_state IS NULL AND retry_count < MAX_RETRIES`) returns ZERO rows for that id. `GET /api/articles?final_state=discarded` returns it. |
 | 13 | Auth single path | (a) Delete SKILLS/.env, run cowork-task-prompt bash; (b) grep -rE 'API_TOKEN=[a-f0-9]{16,}' SKILLS/ cowork-task-prompt.md | (a) Exits 1 with `[error] SKILLS/.env missing or unreadable`. (b) Zero matches. |
-| 14 | Rate limit exemptions | 100 heartbeats in 60s; 100 /api/health in 60s | Zero 429s on /lock and /health. Main bucket: bursts up to 20, then 429 with Retry-After. |
-| 15 | Deploy reproducibility | `bash scripts/deploy.sh` twice on same VPS | First run creates everything. Second run: every step short-circuits, exits 0. `deploy.env` shredded at end. |
+| 14 | Rate limit exemptions + leaky-bucket hourly (ISSUE-10, ISSUE-15, ISSUE-16, ISSUE-20) | (a) 100 heartbeats in 60s on /api/lock/*; (b) 1000 /api/health in 60s; (c) **Paced** 50 /api/articles/min for 20 min (1000 total) from one bearer | (a) Zero 429s on /lock. (b) Zero 429s on /health; `nginx -T \| awk '/location = \/api\/health/,/^[[:space:]]*}$/'` contains no `limit_req`. (c) Zero 429s attributed to tlinh_main in nginx error_log; at least 200 429s attributed to tlinh_hourly (paced 50/min < tlinh_main 100/min cap, but 50/min > tlinh_hourly 16.67/min drain rate so hourly trips after ~3 min). Every 429 has `Retry-After: 60` header. |
+| 15A | Phase A reproducibility (ISSUE-5 + ISSUE-12 + ISSUE-18) | `bash scripts/deploy.sh` twice on same VPS | First run creates DNS, dirs (Step 2), uploads (Step 3), DB+schema (Step 4), .env (Step 5), nginx+cert (Step 6), health-check (Step 7), Mac client (Step 8), launchd (Step 9). Second run: every step short-circuits, exits 0. **`deploy.env` is NOT shredded by Phase A** — it persists on Mac disk so the operator can re-source it for Phase B (per ISSUE-17). Shredding happens at Step 14 after Phase B verifies Telegram. |
+| 15C | deploy.env lifecycle (ISSUE-18) | After Phase A: `ls deploy.env` returns 600-perm file. After Step 14 of Phase B: `ls deploy.env` returns "No such file or directory". | deploy.env survives Phase A, is shredded only at Step 14. |
+| 15B | Phase B is manual (ISSUE-12) | Inspect `scripts/deploy.sh` content | Script does NOT call Cowork UI, does NOT click "Run now", does NOT seed inject-test. Those are documented in §10 Steps 10–13 as manual. |
 | 16 | DNS upsert + SSL guard | (a) bash scripts/dns_setup.sh twice; (b) try enable proxied with SSL mode='off' | (a) First creates, second PATCHes existing, no duplicate. (b) Refuses, exits 1 with `[error] Refusing to enable proxy with SSL mode 'off'`. |
 
 ---
@@ -1463,7 +1880,7 @@ The PLAN.md (v1) is renamed to PLAN-v1.md and PLAN-v2.md becomes the active spec
 
 ## 16. Open questions for user
 
-1. **Cloudflare proxy:** keep proxied=false permanently (simpler), or flip to true after cert issuance (CF protection)?
+1. **Cloudflare proxy:** keep proxied=false permanently (direct-to-origin, simpler), or flip to true later for CF DDoS protection (requires SSL mode `Full (strict)` since origin already has Let's Encrypt cert)?
 2. **launchd schedule:** Daily at 7am ok, or different time/cadence?
 3. **API token rotation:** manual for v1, or build automated rotation in v1.1?
 4. **Backup strategy:** mariadb dump cron daily into `/var/backups/tlinh/`?

@@ -43,7 +43,7 @@ backend/.env.production
 backend/logs/
 backend/vendor/
 SKILLS/.env
-.codex-round2-pending.json
+.codex-round*-pending.json
 *.pem
 *.key
 secrets/
