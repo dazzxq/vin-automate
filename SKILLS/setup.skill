@@ -1,0 +1,191 @@
+---
+name: setup
+description: Re-run VinFast pipeline setup. Use for reconfiguration (new Telegram credentials, refresh skill symlinks, re-verify scheduler). Primary first-time onboarding is BOOTSTRAP.md (paste into chat). This slash command only exists AFTER BOOTSTRAP.md has installed it.
+---
+
+# /setup — Reconfiguration Skill
+
+## When to use this skill
+
+- After BOOTSTRAP.md has run successfully ONCE.
+- You want to re-enter Telegram credentials.
+- You want to re-verify the scheduled task.
+- You want to refresh slash skill symlinks (e.g. after moving the project folder).
+
+For FIRST-TIME onboarding, paste `BOOTSTRAP.md` into a Cowork chat instead.
+
+## Working directory
+The VinFast news pipeline project folder.
+
+---
+
+## Step 1 — OS / version check
+
+```bash
+uname -s && sw_vers -productVersion && uname -m
+```
+
+If `uname -s` ≠ `Darwin`, or `sw_vers -productVersion` major < 13, abort with: "Pipeline yêu cầu macOS 13+. Phát hiện: [system info]."
+
+## Step 2 — Idempotent install.sh
+
+```bash
+bash install.sh
+```
+
+Parse stdout. Each `[ok]` line indicates already-configured. `[install]` lines indicate work being done.
+
+If exit code is 78 → sudo required for Xcode CLT. Tell user: "Cần cài Xcode CLT một lần. Mở Terminal: xcode-select --install. Sau đó quay lại đây gõ /setup."
+
+## Step 3 — Telegram credentials (optional refresh)
+
+Ask user: "Bạn muốn refresh Telegram credentials không? [y/N]"
+
+- On **N** → skip to Step 4.
+- On **y** → run the deterministic nonce flow (same as BOOTSTRAP.md Step 3):
+  1. Ask for new TELEGRAM_BOT_TOKEN.
+  2. Validate: `curl -s "https://api.telegram.org/bot<TOKEN>/getMe"` returns `ok:true`.
+  3. Record baseline_update_id from `getUpdates?timeout=0&limit=100`.
+  4. Generate a random 12-char hex NONCE.
+  5. Tell user: "Mở Telegram, gửi tin nhắn này tới bot của bạn: <NONCE>".
+  6. Poll loop (max 120s):
+     ```
+     while time elapsed < 120:
+       resp = curl getUpdates?offset={baseline+1}&timeout=10&limit=100
+       for each update in resp.result:
+         if update.message.text.strip() == NONCE:
+           chat_id = update.message.chat.id
+           found! break loop
+       sleep 2
+     ```
+  7. Show user "Phát hiện chat: {first_name} ({chat_id}). Xác nhận? [y/N]"
+  8. On y → send test message `"Setup OK — VinFast pipeline ready"` via `sendMessage`. User confirms receipt.
+  9. Write `.env` atomically: write to `.env.tmp` then `mv .env.tmp .env`.
+
+## Step 4 — Re-link slash skills
+
+Detect Cowork skill directory. Probe in order:
+1. `~/Library/Application Support/Claude/skills/`
+2. `~/.claude/skills/`
+
+For the first existing directory, ensure symlinks exist:
+
+```bash
+mkdir -p "$SKILL_DIR/idea-brainstormer" "$SKILL_DIR/setup"
+ln -sf "$PWD/SKILLS/idea-brainstormer.skill" "$SKILL_DIR/idea-brainstormer/SKILL.md"
+ln -sf "$PWD/SKILLS/setup.skill" "$SKILL_DIR/setup/SKILL.md"
+```
+
+If neither directory exists, tell user: "Không phát hiện thư mục skill Cowork. Xem README mục 'Manual skill install'."
+
+## Step 5 — Scheduled task verification (MANDATORY)
+
+Same as BOOTSTRAP.md Step 5 (do NOT use the deprecated in-chat synthetic model).
+
+### Step 5.1 — Pre-arm + snapshot log size
+
+```bash
+TOKEN=$(.venv/bin/python -c 'import secrets; print(secrets.token_hex(6))')
+TEST_BEFORE_TS=$(date +%s)
+.venv/bin/python crawl.py --inject-test "$TOKEN"
+
+# Snapshot pipeline.log BEFORE user clicks Run now so Phase A only matches
+# bytes appended afterward (Signal A).
+LOG_BYTES_BEFORE=0
+[ -f logs/pipeline.log ] && LOG_BYTES_BEFORE=$(wc -c < logs/pipeline.log | tr -d ' ')
+```
+
+### Step 5.2 — Trigger the SAVED task
+
+Ask user to:
+
+1. Open Cowork sidebar → Scheduled.
+2. Check: is there a task named `vinfast-pipeline`? [y/N]
+   - If **N** → "Click '+' New Task → Name: vinfast-pipeline; Frequency: Hourly; paste cowork-task-prompt.md content into prompt; Save."
+   - If **y** → "Click vào task `vinfast-pipeline` → Edit. Verify the prompt matches cowork-task-prompt.md exactly. If different, REPLACE the entire prompt body. Save. DO NOT create a duplicate task."
+   - If user reports MULTIPLE `vinfast-pipeline` tasks → "Xóa các duplicate, chỉ giữ 1."
+3. After save, click "Run now" on the task.
+
+### Step 5.3 — Two-phase adaptive poll
+
+**Phase A — Startup detection (60s)**:
+
+Uses the `LOG_BYTES_BEFORE` snapshot from Step 5.1 (taken BEFORE user clicked Run now).
+
+Two signals (either is sufficient):
+- **Signal A**: new bytes in `logs/pipeline.log` (after `LOG_BYTES_BEFORE`) containing
+  `acquire pipeline-run` (emitted by `lock.py acquire` on success).
+- **Signal B**: `locks` row with `strftime('%s', acquired_at) > TEST_BEFORE_TS`.
+
+```bash
+deadline=$((TEST_BEFORE_TS + 60))
+STARTUP_TS=""
+while [ $(date +%s) -lt $deadline ]; do
+  # Signal A — NEW log content since the snapshot
+  if [ -f logs/pipeline.log ]; then
+    CUR_BYTES=$(wc -c < logs/pipeline.log | tr -d ' ')
+    if [ "$CUR_BYTES" -gt "$LOG_BYTES_BEFORE" ]; then
+      NEW_BYTES=$((CUR_BYTES - LOG_BYTES_BEFORE))
+      if tail -c "$NEW_BYTES" logs/pipeline.log | grep -q "acquire pipeline-run"; then
+        STARTUP_TS=$(date +%s)
+        break
+      fi
+    fi
+  fi
+  # Signal B — fresh lock row by epoch comparison
+  ACTIVE_LOCK=$(sqlite3 news.db "
+    SELECT acquired_at FROM locks
+     WHERE name='pipeline-run'
+       AND strftime('%s', acquired_at) > ${TEST_BEFORE_TS}
+  ")
+  if [ -n "$ACTIVE_LOCK" ]; then
+    STARTUP_TS=$(date +%s)
+    break
+  fi
+  sleep 5
+done
+```
+
+If `STARTUP_TS` empty after 60s → ask: "Đã bấm 'Run now' chưa? Task có hiện trong sidebar?" → retry Step 5.2.
+
+**Phase B — Completion wait (600s from startup_ts)**:
+```bash
+startup_ts=$(date +%s)
+deadline=$((startup_ts + 600))
+while [ $(date +%s) -lt $deadline ]; do
+  notified=$(sqlite3 news.db "SELECT notified_at FROM articles WHERE url='bootstrap-test://$TOKEN'")
+  if [ -n "$notified" ]; then
+    break
+  fi
+  sleep 10
+done
+```
+
+If 600s timeout → tell user "Saved task didn't notify our test row. Verify the prompt body in the saved task is exactly cowork-task-prompt.md (not truncated, not empty)."
+
+### Step 5.4 — Confirm with user
+
+Ask: "Bạn nhận được tin nhắn Telegram chứa chuỗi `<TOKEN>` không? [y/N]"
+
+- On **y** AND notified_at set within Phase B window → SUCCESS. Print: "Setup verified end-to-end. Pipeline sẽ chạy mỗi giờ."
+- On **N** → diagnose chat_id, network, bot blocked.
+
+## Step 6 — Completion summary
+
+```
+✅ Setup hoàn tất + verified end-to-end.
+
+Pipeline sẽ tự chạy mỗi giờ khi Claude Desktop còn mở.
+Mac sleep → miss runs (Cowork catch-up 1 lần khi mở lại app).
+
+Brainstorm: /idea-brainstormer <id>
+Re-config sau: /setup
+```
+
+---
+
+## Rules
+
+- Steps 1, 2, 4, 5 are mandatory. Step 3 (Telegram refresh) is optional.
+- Do NOT use in-chat synthetic pipeline run for verification — must exercise the SAVED scheduled task via "Run now".
+- The TOKEN ensures attribution: only a run that processes our specific tokenized row can flip its notified_at. No false positives from concurrent runs.

@@ -29,6 +29,7 @@ readonly SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 log()       { printf '[info]    %s\n' "$*"; }
 log_check() { printf '[check]   %s\n' "$*"; }
 log_inst()  { printf '[install] %s\n' "$*"; }
+log_init()  { printf '[init]    %s\n' "$*"; }   # used by step_schema per PLAN Task 3 log contract
 log_ok()    { printf '[ok]      %s\n' "$*"; }
 log_warn()  { printf '[warn]    %s\n' "$*" >&2; }
 log_err()   { printf '[error]   %s\n' "$*" >&2; }
@@ -258,19 +259,49 @@ step_network() {
 }
 
 # -----------------------------------------------------------------------------
-# Step 10 — Summary
+# Step 10 — Schema init (added in install.sh v2 by Task 3)
+#
+# Idempotent: db.init_db() uses CREATE TABLE IF NOT EXISTS for both `articles`
+# and `locks` tables.
+# -----------------------------------------------------------------------------
+
+step_schema() {
+    # Tagged log contract from PLAN.md Task 3:
+    #   [check] news.db exists or fresh init
+    #   [init]  creating articles + locks tables
+    #   [ok]    schema initialized
+    log_check "news.db exists or fresh init"
+    if [[ ! -f "$SCRIPT_DIR/db.py" ]]; then
+        log_warn "db.py not present yet — skipping schema init (Task 3 not yet in place)"
+        return 0
+    fi
+    log_init "creating articles + locks tables"
+    if ! "$SCRIPT_DIR/.venv/bin/python" -c "from db import init_db; init_db()"; then
+        fatal 1 "init_db() failed"
+    fi
+    log_ok "schema initialized"
+    if [[ -f "$SCRIPT_DIR/news.db" ]]; then
+        log_ok "news.db tables: $(.venv/bin/python -c \
+            "import sqlite3; c=sqlite3.connect('$SCRIPT_DIR/news.db'); \
+             print(','.join(r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='table' ORDER BY name\")))")"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Step 11 — Summary
 # -----------------------------------------------------------------------------
 
 print_summary() {
     echo
     echo "================================================================"
-    echo " VinFast News Pipeline — install.sh v1 complete"
+    echo " VinFast News Pipeline — install.sh complete"
     echo "================================================================"
     echo " Project:       $SCRIPT_DIR"
     echo " Python:        $PYTHON_BIN"
     echo " venv:          $SCRIPT_DIR/.venv"
     echo " Homebrew:      $(command -v brew || echo 'not on PATH')"
     echo " logs/:         $SCRIPT_DIR/logs"
+    echo " news.db:       $([[ -f "$SCRIPT_DIR/news.db" ]] && echo "$SCRIPT_DIR/news.db" || echo 'not created')"
     echo
     echo " Next steps:"
     echo "   1. Open Claude Desktop, add this folder to Cowork trusted folders."
@@ -285,7 +316,7 @@ print_summary() {
 
 main() {
     cd "$SCRIPT_DIR"
-    log "Starting install.sh v1 (Task 1, idempotent)"
+    log "Starting install.sh (Tasks 1+3, idempotent)"
     step_os_check
     step_arch
     step_xcode_clt
@@ -295,8 +326,9 @@ main() {
     step_venv
     step_logs
     step_network
+    step_schema
     print_summary
-    log_ok "Done. install.sh v1 finished without errors."
+    log_ok "Done. install.sh finished without errors."
 }
 
 main "$@"
