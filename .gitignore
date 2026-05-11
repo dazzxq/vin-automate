@@ -1,0 +1,36 @@
+# Secrets
+.env
+
+# Database
+news.db
+news.db-journal
+news.db-wal
+news.db-shm
+
+# Virtualenv
+.venv/
+
+# Logs
+logs/*.log
+logs/*.lock
+logs/*.owner
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Codex review artifacts (sessions, render outputs, telemetry) — entire tree
+.codex-review/

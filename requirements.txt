@@ -1,0 +1,6 @@
+# Pinned to exact versions tested with this plan (per Codex ISSUE-2).
+# To bump, update here AND re-run E2E validation.
+trafilatura==1.12.2
+feedparser==6.0.12
+httpx==0.28.1
+python-dotenv==1.2.2
