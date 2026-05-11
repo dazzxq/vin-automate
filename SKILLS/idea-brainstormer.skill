@@ -1,12 +1,73 @@
 ---
 name: idea-brainstormer
-description: Brainstorm 5 GenK-style story ideas from an article in the VinFast pipeline DB. Invoked as /idea-brainstormer [ID | "search keyword" | empty for picker]. Reads DB via list.py — DB is single source of truth.
+description: Brainstorm 5 GenK-style story ideas from a VinFast pipeline article. Invoked as /idea-brainstormer [ID | "search keyword" | empty for picker]. Reads + writes via the VPS HTTP API; SKILLS/.env supplies the bearer token.
 ---
 
-# /idea-brainstormer — Brainstorm Skill
+# /idea-brainstormer — Brainstorm Skill (v2 — HTTP-based)
 
 ## Working directory
 The VinFast news pipeline project folder (already granted Cowork access).
+
+## Auth (mandatory — per PLAN-v2 §5.3 Auth)
+
+Every bash invocation that touches the API MUST source `SKILLS/.env` first.
+No hardcoded tokens. No interactive prompts. Failure to source is a hard exit.
+
+```bash
+set -a && . SKILLS/.env && set +a || {
+  echo "[error] SKILLS/.env missing or unreadable" >&2
+  exit 1
+}
+```
+
+After sourcing, `$API_BASE_URL` and `$API_TOKEN` are in env. Never echo them.
+
+`api` helper — keep `$API_TOKEN` out of argv via `curl -K -` (config from
+stdin). **Define + auth-source at the top of EVERY bash block** (Cowork
+sessions don't share env or shell functions across blocks):
+
+```bash
+set -a && . SKILLS/.env && set +a || {
+  echo "[error] SKILLS/.env missing or unreadable" >&2
+  exit 1
+}
+
+# api METHOD PATH [BODY_FILE] — prints one line: STATUS<TAB>RETRY_AFTER<TAB>BODY
+# 3rd arg is a FILE PATH (never a shell string). Cowork should use its
+# Write tool to materialize the JSON payload (which handles all character
+# encoding) then call api() with that path. This avoids shell-quoting
+# hazards from model-generated content (quotes, backslashes, newlines).
+# Does NOT use `curl -fsS` (which would swallow 4xx/5xx body and prevent
+# branching on 400/404/429). Caller parses STATUS and BODY explicitly.
+api() {
+  local method="$1" path="$2" body_file="${3:-}"
+  local hdrf bodyf rc
+  hdrf=$(mktemp /tmp/.tlinh-h.XXXXXX); bodyf=$(mktemp /tmp/.tlinh-b.XXXXXX)
+  local cfg
+  cfg=$(printf 'url = "%s%s"\nheader = "Authorization: Bearer %s"\nheader = "Accept: application/json"\n' \
+    "$API_BASE_URL" "$path" "$API_TOKEN")
+  if [ -n "$body_file" ]; then
+    if [ ! -f "$body_file" ]; then
+      rm -f "$hdrf" "$bodyf"
+      printf '0\t\t{"error":"local","detail":"missing body file %s"}\n' "$body_file"
+      return 1
+    fi
+    cfg+=$'\n''header = "Content-Type: application/json"'
+    rc=$(printf '%s' "$cfg" | curl -sS -X "$method" --max-time 60 -K - \
+        -D "$hdrf" -o "$bodyf" -w '%{http_code}' --data-binary "@$body_file")
+  else
+    rc=$(printf '%s' "$cfg" | curl -sS -X "$method" --max-time 60 -K - \
+        -D "$hdrf" -o "$bodyf" -w '%{http_code}')
+  fi
+  local retry_after; retry_after=$(awk 'BEGIN{IGNORECASE=1} /^Retry-After:/ {sub(/^[^:]*:[ \t]*/,""); sub(/\r?$/,""); print; exit}' "$hdrf")
+  local out; out=$(cat "$bodyf")
+  rm -f "$hdrf" "$bodyf"
+  printf '%s\t%s\t%s\n' "${rc:-0}" "${retry_after:-}" "$out"
+}
+```
+
+Below, every `<PREAMBLE>` placeholder means: paste the two blocks above
+(auth-source + api() definition) literally at the top of that bash block.
 
 ## How users invoke me
 
@@ -20,38 +81,56 @@ The VinFast news pipeline project folder (already granted Cowork access).
 
 ## Step-by-step
 
-### Step 1 — Resolve user input to a list.py invocation
+### Step 1 — Resolve user input to an API call
 
-Inspect the user's argument:
+Inspect the user's argument and build one of these bash blocks. **Each block
+includes the `<PREAMBLE>` placeholder — paste the auth-source + api()
+definition from the top of this file literally there**, then run.
 
-- **Pure integer** (e.g. `42`) → query for that specific id:
+- **Pure integer** (e.g. `42`) → fetch directly:
   ```bash
-  .venv/bin/python list.py --id 42 --json
+  <PREAMBLE>
+  RESP=$(api GET '/api/articles/42')
+  STATUS=$(printf '%s' "$RESP" | cut -f1)
+  BODY=$(printf '%s' "$RESP" | cut -f3-)
+  echo "status=$STATUS"; echo "$BODY"
   ```
-- **No arg or empty** → today's top:
+  Server returns a single article object on 200. 404 means no such id.
+- **No arg or empty** → today's top candidates not yet brainstormed:
   ```bash
-  .venv/bin/python list.py --today --score-gte 3 --not-brainstormed --json
+  <PREAMBLE>
+  api GET '/api/articles?stage=scored&min_score=3&not_brainstormed=1&last_hours=24'
   ```
-  If empty, relax filter to `--score-gte 2`. If still empty, query `--yesterday --score-gte 4`. If still empty, ask user "Không có article nào hợp lệ hôm nay. Bạn muốn brainstorm article id nào cụ thể?"
-- **Keyword in quotes** (e.g. `"VF8"`) → search:
+  If `rows[]` is empty, relax to `min_score=2`. If still empty, try
+  `&last_hours=48`. If still empty, ask user
+  "Không có article nào hợp lệ hôm nay. Bạn muốn brainstorm article id nào cụ thể?"
+- **Keyword in quotes** (e.g. `"VF8"`) → search (URL-encode spaces as `%20`):
   ```bash
-  .venv/bin/python list.py --search "VF8" --json
+  <PREAMBLE>
+  api GET '/api/articles?search=VF8&not_brainstormed=1'
   ```
-- **`score=N`** → exact score:
+- **`score=N`** → exact score, not yet brainstormed:
   ```bash
-  .venv/bin/python list.py --score N --not-brainstormed --json
+  <PREAMBLE>
+  api GET '/api/articles?score=N&not_brainstormed=1'
   ```
-- **`yesterday`** → :
+- **`yesterday`** → 24–48h window:
   ```bash
-  .venv/bin/python list.py --yesterday --not-brainstormed --json
+  <PREAMBLE>
+  api GET '/api/articles?last_hours=48&not_brainstormed=1'
   ```
-- **Other text** → treat as search keyword (drop quotes if any).
+- **Other free text** → treat as search keyword (strip quotes if any).
+
+In every case: STATUS=200 is the only success status. 429 → wait
+`Retry-After` (typically 60s) and retry **exactly ONCE** (this is a
+non-lock endpoint, per PLAN-v2 §7.4: `/api/articles/*` gets one retry only,
+not three). Anything else → tell the user "API trả về lỗi STATUS" and stop.
 
 ### Step 2 — Pick the target id
 
-If Step 1 returned exactly one row → that is the target id; skip to Step 3.
+If Step 1 returned exactly one row → that is the target id; go to Step 3.
 
-If multiple rows → display a compact table to the user:
+If multiple rows (`rows[]` length ≥ 2) → display a compact table:
 
 ```
 1. [#42] (score 5) VnExpress — VinFast Q1 2026 vượt expect...
@@ -59,7 +138,7 @@ If multiple rows → display a compact table to the user:
 3. [#51] (score 4) Electrek  — VinFast partners with US battery...
 ```
 
-Then ask: "Brainstorm article nào? (paste id, ví dụ 42)"
+Ask: "Brainstorm article nào? (paste id, ví dụ 42)"
 Wait for user reply. Re-parse as integer; if invalid, ask again.
 
 If zero rows → tell user "Không có article phù hợp" and stop.
@@ -67,32 +146,90 @@ If zero rows → tell user "Không có article phù hợp" and stop.
 ### Step 3 — Read full article content
 
 ```bash
-.venv/bin/python list.py --id <CHOSEN_ID> --json
+<PREAMBLE>
+RESP=$(api GET '/api/articles/<CHOSEN_ID>')
+STATUS=$(printf '%s' "$RESP" | cut -f1)
+BODY=$(printf '%s' "$RESP" | cut -f3-)
+[ "$STATUS" = "200" ] || { echo "[fatal] $STATUS: $BODY" >&2; exit 1; }
+echo "$BODY"
 ```
 
-The JSON has `id`, `title`, `source`, `content`, `score`, `score_reason`, optionally previous `ideas`.
+The JSON has `id`, `title`, `source`, `content`, `score`, `score_reason`,
+optionally previous `ideas` (decoded JSON, not string).
 
 ### Step 4 — Read the guidelines
 
-Read `brainstorm-guidelines.md` from the project root. It defines the JSON output shape and editorial rules.
+Read `brainstorm-guidelines.md` from the project root. It defines the output
+shape and editorial rules.
 
 ### Step 5 — Generate 5 ideas
 
-Apply `brainstorm-guidelines.md` to produce a JSON array of EXACTLY 5 idea objects, each with fields `title`, `angle`, `format`, `difficulty`, `viral_potential`.
+Apply `brainstorm-guidelines.md` to produce a JSON array of EXACTLY 5 idea
+objects, each with fields `title`, `angle`, `format`, `difficulty`,
+`viral_potential` (integer 1–5).
 
-Construct the JSON literally as a single line (compact). Validate before next step: 5 elements, each is an object with all required fields, `viral_potential` is integer 1–5.
+Construct the JSON literally as compact one-line. **Validate before Step 6**:
+- exactly 5 elements,
+- each element has all 5 required fields,
+- `viral_potential` is integer 1–5,
+- string fields are non-empty.
 
-### Step 6 — Write to DB
+You may use WebSearch + MCP tools for additional research context before
+finalizing the ideas — Cowork has those tools available.
+
+### Step 6 — Write to VPS via PATCH
+
+**Do NOT pass `<JSON_ARRAY_LITERAL>` through a bash command line.** Cowork
+uses the **Write tool** (not bash) to materialize the wrapper JSON to a
+file path, then api() reads the file via `curl --data-binary @file`. This
+sidesteps every shell-quoting hazard the model output could trigger.
+
+Cowork action: invoke the **Write tool** with `file_path` =
+`/tmp/.tlinh-brainstorm-body.json` and `content` = the literal wrapper JSON:
+```json
+{"ideas": [
+  {"title": "...", "angle": "...", "format": "...", "difficulty": "...", "viral_potential": 4},
+  ... 4 more
+]}
+```
+Then run:
 
 ```bash
-.venv/bin/python mark.py brainstorm <CHOSEN_ID> '<JSON_ARRAY_LITERAL>'
+<PREAMBLE>
+
+# Per PLAN-v2 §7.4: non-lock endpoints retry exactly ONCE on 429 (or
+# 5xx), then bubble up. Lock endpoints get 3 retries (not applicable here).
+attempt=1
+while [ $attempt -le 2 ]; do
+  RESP=$(api PATCH "/api/articles/<CHOSEN_ID>/brainstorm" /tmp/.tlinh-brainstorm-body.json)
+  STATUS=$(printf '%s' "$RESP" | cut -f1)
+  RETRY_AFTER=$(printf '%s' "$RESP" | cut -f2)
+  BODY=$(printf '%s' "$RESP" | cut -f3-)
+  case "$STATUS" in
+    200) echo "$BODY"; break ;;                                # {"id":...,"updated":true,"brainstormed_at":"..."}
+    400) echo "[fatal] JSON validation: $BODY" >&2; exit 1 ;;  # fix the array shape and re-run
+    429) if [ $attempt -lt 2 ]; then
+           sleep "${RETRY_AFTER:-1}"
+           attempt=$((attempt + 1))
+           continue
+         fi
+         echo "[error] PATCH /brainstorm 429 after 1 retry" >&2; exit 1 ;;
+    5*)  if [ $attempt -lt 2 ]; then
+           echo "[transient] 5xx attempt $attempt; sleeping 2s" >&2
+           sleep 2; attempt=$((attempt + 1)); continue
+         fi
+         echo "[error] PATCH /brainstorm 5xx after 1 retry: $BODY" >&2; exit 1 ;;
+    *)   echo "[error] PATCH /brainstorm returned $STATUS: $BODY" >&2; exit 1 ;;
+  esac
+done
 ```
 
-Quote the JSON array in single quotes. `mark.py` validates the JSON shape and will exit 2 with a clear error if anything is wrong — in which case, fix the JSON and retry.
+The server allows re-brainstorming the same id (overwrites `ideas` + bumps
+`brainstormed_at`); no CAS check.
 
 ### Step 7 — Display to user
 
-Render the 5 ideas as a readable table for the user. Example:
+Render the 5 ideas as a readable table:
 
 ```
 ✨ 5 ideas brainstormed cho article #42:
@@ -103,17 +240,27 @@ Render the 5 ideas as a readable table for the user. Example:
 
 2. ...
 
-Đã lưu vào DB (brainstormed_at). Chọn idea nào để bắt đầu viết?
+Đã lưu vào VPS (brainstormed_at). Chọn idea nào để bắt đầu viết?
 ```
 
 ## Error handling
 
-- **Article id not found** (Step 3 returns empty) → tell user; do NOT call mark.py.
-- **Content empty** in row → continue brainstorm using title only, mention in ideas that "cần verify content".
-- **mark.py exits 2 (JSON validation failure)** → review the generated JSON, fix shape, retry.
+- **Article id not found** (Step 1/3 returns 404) → tell user; do NOT PATCH.
+- **Content empty** in row → continue brainstorm using title only, mention in
+  ideas that "cần verify content".
+- **PATCH returns 400** (JSON validation failure on server) → review the
+  generated JSON, fix shape, retry.
+- **PATCH returns 5xx / network error** → retry once with 2s backoff, then
+  surface the error to the user. Do NOT call /fail — brainstorm has no
+  retry_count gating.
+- **PATCH returns 429** → respect `Retry-After` header (typically 60s).
 
 ## Rules
 
-- Always preserve user's `notified_at` and `scored_at` — `mark.py brainstorm` only writes `ideas` + `brainstormed_at`, never touches other timestamps.
-- Re-brainstorming the same id is allowed; it overwrites `ideas` with the latest run.
+- Always preserve `notified_at`, `scored_at`, `extracted_at` — `PATCH
+  /brainstorm` only writes `ideas` + `brainstormed_at`, never touches other
+  timestamps.
+- Re-brainstorming the same id is allowed; it overwrites `ideas` with the
+  latest run.
+- Do NOT echo `$API_TOKEN`. The api() helper keeps it on stdin.
 - Do NOT add steps not in this list. Stick to the 7 steps.
