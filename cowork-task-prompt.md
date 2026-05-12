@@ -427,7 +427,7 @@ your context for the rest of this run. Do not invent a new value.
 
 **R5: Do not invent extra steps.**
 Run exactly Steps 1–9 in order. Do NOT call `PATCH /brainstorm` — brainstorm
-is on-demand only via the `/idea-brainstormer` slash skill.
+is on-demand only via the `/vf-brainstorm` slash skill.
 
 **R6: Article cap.**
 The server caps at `MAX_ARTICLES_PER_LIST` (default 50) via `ORDER BY` that

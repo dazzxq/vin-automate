@@ -27,7 +27,7 @@ Build a 3-tier news aggregation pipeline:
 - **Persist** state in MariaDB on a VPS, exposed via a small PHP HTTP API.
 - **Score 1–5** via Claude in Cowork (scheduled daily task reads queue from VPS, scores, writes back).
 - **Push** high-score articles to Telegram (sent by VPS backend on `/api/notify/{id}` trigger).
-- **Brainstorm** 5 ideas per article via Cowork `/idea-brainstormer` slash skill, persisting result back to VPS.
+- **Brainstorm** 5 ideas per article via Cowork `/vf-brainstorm` slash skill, persisting result back to VPS.
 
 **Out of scope (v2):**
 - Multi-user, multi-topic isolation (v2 is single-user, single-topic VinFast)
@@ -93,7 +93,7 @@ Build a 3-tier news aggregation pipeline:
 │   curl GET  ../api/articles?stage=scored&min_score=3&not_notified=1 │
 │   curl POST ../api/notify/{id} (per row) → VPS sends Telegram       │
 │                                                                     │
-│ /idea-brainstormer 42 slash skill (on-demand chat):                 │
+│ /vf-brainstorm 42 slash skill (on-demand chat):                 │
 │   curl GET   ../api/articles/42                                     │
 │   → Claude reads + WebSearch + MCP context                          │
 │   → Claude generates 5-idea JSON via brainstorm-guidelines.md       │
@@ -802,15 +802,15 @@ vin-automate-main/
 ```
 vin-automate-main/
 ├── SKILLS/
-│   ├── idea-brainstormer.skill           (rewritten: HTTP-based)
+│   ├── vf-brainstorm.skill                (rewritten: HTTP-based)
 │   └── (NO setup.skill — not needed in v2)
 ├── cowork-task-prompt.md                 (rewritten: HTTP-based scoring loop)
 ├── scoring-rubric.md                     (unchanged from v1)
 └── brainstorm-guidelines.md              (unchanged from v1)
 ```
 
-**`SKILLS/idea-brainstormer.skill` content:**
-- Invocation: `/idea-brainstormer <id|filter>`
+**`SKILLS/vf-brainstorm.skill` content:**
+- Invocation: `/vf-brainstorm <id|filter>`
 - Steps:
   1. Resolve user input → API filter.
   2. `curl -H "Authorization: Bearer $TOKEN" "https://tlinh.duyet.vn/api/articles?<filter>"` → parse JSON.
@@ -857,7 +857,7 @@ Single mechanism only. **No hardcoded tokens in skill files or task prompts.**
    - Failure to source = hard exit; do NOT fall back to interactive prompt or hardcoded default.
 4. This applies to BOTH:
    - The scheduled task prompt (paste into Cowork's `/schedule` UI).
-   - The `/idea-brainstormer` slash skill body.
+   - The `/vf-brainstorm` slash skill body.
 5. The path `/path/to/project/SKILLS/.env` is the absolute path to the granted folder. The deploy runbook (§10) documents how to locate it for the user's specific Cowork project (typically `/Users/.../vin-automate-main/SKILLS/.env`).
 
 Hardcoded tokens, environment frontmatter, or interactive prompts are FORBIDDEN — they reintroduce v1-class secret leakage risk.
@@ -1181,7 +1181,7 @@ VPS-side message builder (PHP):
 
 <a href="https://vnexpress.net/...">Đọc bài</a>
 
-Brainstorm: <code>/idea-brainstormer 42</code>
+Brainstorm: <code>/vf-brainstorm 42</code>
 ```
 
 - HTML parse mode (`parse_mode=HTML`).
@@ -1681,7 +1681,7 @@ Tasks ordered by dependency. Each task = 1 commit, reviewed by Codex.
 | 11 | Mac `crawl.py` rewrite (HTTP-based) | `crawl.py` | `python crawl.py --dry-run` reports counts; real run inserts via API; same url_hash as VPS computes |
 | 12 | Mac `extract.py` rewrite (HTTP-based, two-level retry, calls /fail on exhaust) | `extract.py` | Extracts rows where `extracted_at IS NULL`; on transient exhaustion calls POST /fail with stage=extract |
 | 13 | **Cowork scheduled task prompt** (single auth path per ISSUE-4, exempts /lock from 429 per ISSUE-7) | `cowork-task-prompt.md` | First line sources SKILLS/.env or hard-exits; heartbeat handling respects 429 retry-after; tolerates 429 on lock endpoints without aborting |
-| 14 | **Cowork brainstorm skill** (single auth path) | `SKILLS/idea-brainstormer.skill` | `/idea-brainstormer 42` produces 5 ideas, written via PATCH; sources SKILLS/.env |
+| 14 | **Cowork brainstorm skill** (single auth path) | `SKILLS/vf-brainstorm.skill` | `/vf-brainstorm 42` produces 5 ideas, written via PATCH; sources SKILLS/.env |
 | 15 | launchd plist + `main.py` orchestrator | `com.tlinh.crawl.plist`, `main.py` | `launchctl kickstart` triggers crawl + extract; logs land in `logs/crawl.out` |
 | 16 | install.sh slimmed (venv + deps only, no schema) | `install.sh` | First run installs deps; second run no-op; no news.db created |
 | 17 | README v2 | `README.md` | Onboarding instructions accurate; quickstart works end-to-end with one user following |
@@ -1710,9 +1710,9 @@ Cowork's saved daily task `vinfast-pipeline`, when clicked "Run now":
 
 End state: user receives Telegram messages for high-score articles.
 
-### AC #4 — /idea-brainstormer skill writes brainstorm
+### AC #4 — /vf-brainstorm skill writes brainstorm
 
-In Cowork chat, `/idea-brainstormer 42` reads article via `/api/articles/42`, generates 5 ideas, PATCHes via `/api/articles/42/brainstorm`. DB row has `brainstormed_at NOT NULL` and `ideas` JSON of length 5.
+In Cowork chat, `/vf-brainstorm 42` reads article via `/api/articles/42`, generates 5 ideas, PATCHes via `/api/articles/42/brainstorm`. DB row has `brainstormed_at NOT NULL` and `ideas` JSON of length 5.
 
 ### AC #5 — Concurrency safety (run-level + per-row + notify 2-phase)
 
@@ -1830,7 +1830,7 @@ Title containing `<b>&*_[]</b>` → server escapes via `htmlspecialchars`; Teleg
 | 1-rerun | Idempotency | Run crawl.py twice in succession | 2nd run: 0 new (or all existing). url_hash UNIQUE prevents dups. |
 | 2 | Mac extract | `.venv/bin/python extract.py --pending` | Rows have content + extracted_at. |
 | 3 | Cowork score loop | Cowork sidebar → vinfast-pipeline → "Run now" | All extracted rows get scored. Telegram receives high-score alerts. |
-| 4 | Brainstorm skill | `/idea-brainstormer 42` in Cowork chat | DB row 42: brainstormed_at + ideas[5] populated. User sees ideas table. |
+| 4 | Brainstorm skill | `/vf-brainstorm 42` in Cowork chat | DB row 42: brainstormed_at + ideas[5] populated. User sees ideas table. |
 | 5 | Concurrent acquire | Two shell sessions both call `/api/lock/pipeline-run/acquire` | 2nd → 409. Only 1 row in locks table. |
 | 6 | Auth check | `curl /api/articles` (no bearer), then with correct | 401, then 200. |
 | 7 | Idempotent score | Two PATCH score on same id | 2nd: updated=false. DB unchanged. |

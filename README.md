@@ -54,7 +54,7 @@ Mac and Cowork each talk to it.
 │ Cowork (Claude Desktop, scheduled daily task)                          │
 │   GET /api/articles?stage=extracted → score → PATCH /score             │
 │   GET ?stage=scored&min_score=3 → POST /api/notify/{id}                │
-│   /idea-brainstormer slash skill on-demand                             │
+│   /vf-brainstorm slash skill on-demand                             │
 │                          │                                             │
 │                          ▼                                             │
 │   Telegram POST via VPS PHP (not Mac/Cowork)                           │
@@ -150,7 +150,7 @@ returns 200 and the launchd job is registered.
   crawls new candidates and extracts content. Cowork's saved daily task
   scores them and triggers Telegram notifications.
 - **On-demand brainstorm:** open a Cowork chat and type
-  `/idea-brainstormer 42` to generate 5 GenK-style ideas for article #42.
+  `/vf-brainstorm 42` to generate 5 GenK-style ideas for article #42.
   The skill PATCHes them back to the VPS so they persist.
 - **Inspect state:** `curl -H "Authorization: Bearer $API_TOKEN" https://tlinh.duyet.vn/api/articles?stage=scored | jq`.
 
@@ -188,7 +188,7 @@ vin-automate/
 │   └── telegram-nonce-helper.sh
 │
 ├── SKILLS/
-│   └── idea-brainstormer.skill   # Cowork slash skill (HTTP-based)
+│   └── vf-brainstorm.skill        # Cowork slash skill (HTTP-based)
 │
 ├── cowork-task-prompt.md     # paste into Cowork /schedule UI
 ├── scoring-rubric.md         # editorial 1–5 rubric (unchanged from v1)
@@ -238,7 +238,7 @@ review until APPROVE before merging:
 | Tasks 3-6 PHP route handlers + Telegram | n/a | 4 rounds, 6 issues |
 | Tasks 8-9 deploy/DNS/telegram scripts | n/a | 5 rounds, 11 issues |
 | Tasks 10-12 Mac client (api_client + crawl + extract) | n/a | 3 rounds, 5 issues |
-| Tasks 13-14 Cowork prompt + idea-brainstormer skill | n/a | 6 rounds, 15 issues |
+| Tasks 13-14 Cowork prompt + vf-brainstorm skill (formerly idea-brainstormer) | n/a | 6 rounds, 15 issues |
 | Tasks 15-16 launchd plist + main.py + install.sh | n/a | 3 rounds, 4 issues |
 
 Total: **34 review rounds, 67 issues resolved** before any commit landed.

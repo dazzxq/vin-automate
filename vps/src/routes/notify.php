@@ -255,7 +255,7 @@ final class Notify
              . "<b>{$title}</b>\n"
              . ($reason !== '' ? "<i>{$reason}</i>\n\n" : "\n")
              . "<a href=\"{$urlEsc}\">Đọc bài</a>\n\n"
-             . "Brainstorm: <code>/idea-brainstormer {$id}</code>";
+             . "Brainstorm: <code>/vf-brainstorm {$id}</code>";
     }
 
     private static function releaseClaim(\PDO $pdo, int $id, string $ownerId): void

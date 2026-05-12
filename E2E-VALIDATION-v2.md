@@ -60,11 +60,11 @@ Expected:
 
 ---
 
-## AC #4 — /idea-brainstormer skill writes brainstorm
+## AC #4 — /vf-brainstorm skill writes brainstorm
 
 In a Cowork chat:
 ```
-/idea-brainstormer 42
+/vf-brainstorm 42
 ```
 (use any scored, non-bootstrap article id from `GET /api/articles?stage=scored&limit=10`.)
 

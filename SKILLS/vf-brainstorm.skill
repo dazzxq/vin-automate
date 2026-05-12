@@ -1,9 +1,9 @@
 ---
-name: idea-brainstormer
-description: Brainstorm 5 GenK-style story ideas from a VinFast pipeline article. Invoked as /idea-brainstormer [ID | "search keyword" | empty for picker]. Reads + writes via the VPS HTTP API; SKILLS/.env supplies the bearer token.
+name: vf-brainstorm
+description: Brainstorm 5 GenK-style story ideas from a VinFast pipeline article. Invoked as /vf-brainstorm [ID | "search keyword" | empty for picker]. Reads + writes via the VPS HTTP API; SKILLS/.env supplies the bearer token.
 ---
 
-# /idea-brainstormer — Brainstorm Skill (v2 — HTTP-based)
+# /vf-brainstorm — Brainstorm Skill (v2 — HTTP-based)
 
 ## Working directory
 The VinFast news pipeline project folder (already granted Cowork access).
@@ -73,11 +73,11 @@ Below, every `<PREAMBLE>` placeholder means: paste the two blocks above
 
 | User input | What I do |
 |---|---|
-| `/idea-brainstormer 42` | Brainstorm article id 42 directly |
-| `/idea-brainstormer` (no args) | Show today's top candidates, ask user to pick |
-| `/idea-brainstormer "VF8"` | Search title/content for "VF8", show matches |
-| `/idea-brainstormer score=5` | Show score=5 candidates not yet brainstormed |
-| `/idea-brainstormer yesterday` | Show yesterday's candidates |
+| `/vf-brainstorm 42` | Brainstorm article id 42 directly |
+| `/vf-brainstorm` (no args) | Show today's top candidates, ask user to pick |
+| `/vf-brainstorm "VF8"` | Search title/content for "VF8", show matches |
+| `/vf-brainstorm score=5` | Show score=5 candidates not yet brainstormed |
+| `/vf-brainstorm yesterday` | Show yesterday's candidates |
 
 ## Step-by-step
 
